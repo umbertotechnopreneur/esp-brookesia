@@ -264,6 +264,10 @@ struct Style {
     std::optional<std::string> bg_color;
     std::optional<std::string> bg_gradient_color;
     std::optional<std::string> bg_gradient_direction;
+    std::optional<int32_t> bg_gradient_center_x;
+    std::optional<int32_t> bg_gradient_center_y;
+    std::optional<int32_t> bg_gradient_end_x;
+    std::optional<int32_t> bg_gradient_end_y;
     std::optional<std::string> text_color;
     std::optional<std::string> border_color;
     std::optional<std::string> line_color;
@@ -605,8 +609,9 @@ BROOKESIA_DESCRIBE_STRUCT(
 )
 BROOKESIA_DESCRIBE_STRUCT(
     Style, (),
-    (bg_color, bg_gradient_color, bg_gradient_direction, text_color, border_color, line_color, arc_color,
-     arc_gradient_color, font, bg_main_stop, bg_gradient_stop, bg_gradient_opacity, border_width, radius, padding,
+    (bg_color, bg_gradient_color, bg_gradient_direction, bg_gradient_center_x, bg_gradient_center_y,
+     bg_gradient_end_x, bg_gradient_end_y, text_color, border_color, line_color, arc_color, arc_gradient_color, font,
+     bg_main_stop, bg_gradient_stop, bg_gradient_opacity, border_width, radius, padding,
      padding_left, padding_right, padding_top, padding_bottom, margin, margin_left, margin_right, margin_top,
      margin_bottom, shadow_width, shadow_offset_x, shadow_offset_y, shadow_color, opacity, line_width, image_opacity,
      image_recolor, image_recolor_opacity, font_size, image_font_size, text_align, arc_width, arc_opacity,

@@ -2176,6 +2176,26 @@ static std::expected<Style, std::string> parse_style_object(
     if (!bg_gradient_direction) {
         return std::unexpected(bg_gradient_direction.error());
     }
+    auto bg_gradient_center_x =
+        parse_optional_scaled("bg_gradient_center_x", style.bg_gradient_center_x, "dp", environment.density);
+    if (!bg_gradient_center_x) {
+        return std::unexpected(bg_gradient_center_x.error());
+    }
+    auto bg_gradient_center_y =
+        parse_optional_scaled("bg_gradient_center_y", style.bg_gradient_center_y, "dp", environment.density);
+    if (!bg_gradient_center_y) {
+        return std::unexpected(bg_gradient_center_y.error());
+    }
+    auto bg_gradient_end_x =
+        parse_optional_scaled("bg_gradient_end_x", style.bg_gradient_end_x, "dp", environment.density);
+    if (!bg_gradient_end_x) {
+        return std::unexpected(bg_gradient_end_x.error());
+    }
+    auto bg_gradient_end_y =
+        parse_optional_scaled("bg_gradient_end_y", style.bg_gradient_end_y, "dp", environment.density);
+    if (!bg_gradient_end_y) {
+        return std::unexpected(bg_gradient_end_y.error());
+    }
     auto text_color = parse_optional_string("text_color", style.text_color);
     if (!text_color) {
         return std::unexpected(text_color.error());

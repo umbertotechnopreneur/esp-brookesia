@@ -162,7 +162,13 @@ public:
         auto result_promise = std::make_shared<boost::promise<Result>>();
         auto result_future = result_promise->get_future();
         auto task = [result_promise, fn = std::forward<Fn>(fn)]() mutable {
-            result_promise->set_value(fn());
+            try {
+                result_promise->set_value(fn());
+            } catch (...) {
+                // A synchronous caller must receive the original exception.
+                // Otherwise TaskScheduler catches it and the future waits forever.
+                result_promise->set_exception(boost::current_exception());
+            }
         };
         if (!task_scheduler_->post(std::move(task), nullptr, group)) {
             return std::move(post_error_result);

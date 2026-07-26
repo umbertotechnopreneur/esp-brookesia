@@ -4059,6 +4059,9 @@ public:
         if (record == nullptr) {
             return false;
         }
+        if (record->node.common_props.hidden == hidden) {
+            return true;
+        }
         record->node.common_props.hidden = hidden;
         backend->apply_props(record->handle, record->node, PropsApplyMask::CommonHidden);
         return true;
@@ -4088,6 +4091,10 @@ public:
         if (record == nullptr || (record->node.type != NodeType::Label && record->node.type != NodeType::TextInput &&
                                   record->node.type != NodeType::Checkbox)) {
             return false;
+        }
+        if (record->node.type != NodeType::TextInput &&
+            record->node.label_props.text == text) {
+            return true;
         }
         if (record->node.type == NodeType::TextInput) {
             record->node.text_input_props.text = std::string(text);
@@ -4208,6 +4215,9 @@ public:
                                   record->node.type != NodeType::Arc)) {
             return false;
         }
+        if (record->node.range_props.value == value) {
+            return true;
+        }
         record->node.range_props.value = value;
         backend->apply_props(record->handle, record->node, PropsApplyMask::RangeValue);
         return true;
@@ -4228,6 +4238,9 @@ public:
         auto *record = resolve_view_record(view);
         if (record == nullptr || (record->node.type != NodeType::Switch && record->node.type != NodeType::Checkbox)) {
             return false;
+        }
+        if (record->node.toggle_props.checked == checked) {
+            return true;
         }
         record->node.toggle_props.checked = checked;
         backend->apply_props(record->handle, record->node, PropsApplyMask::ToggleChecked);
@@ -6499,6 +6512,18 @@ private:
         }
         if (source.bg_gradient_direction.has_value()) {
             destination.bg_gradient_direction = source.bg_gradient_direction;
+        }
+        if (source.bg_gradient_center_x.has_value()) {
+            destination.bg_gradient_center_x = source.bg_gradient_center_x;
+        }
+        if (source.bg_gradient_center_y.has_value()) {
+            destination.bg_gradient_center_y = source.bg_gradient_center_y;
+        }
+        if (source.bg_gradient_end_x.has_value()) {
+            destination.bg_gradient_end_x = source.bg_gradient_end_x;
+        }
+        if (source.bg_gradient_end_y.has_value()) {
+            destination.bg_gradient_end_y = source.bg_gradient_end_y;
         }
         if (source.text_color.has_value()) {
             destination.text_color = source.text_color;

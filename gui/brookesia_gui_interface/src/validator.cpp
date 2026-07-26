@@ -13,6 +13,7 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 
@@ -151,10 +152,15 @@ static bool is_valid_color(std::string_view color)
 
 static bool is_valid_gradient_direction(std::string_view direction)
 {
-    return direction == "none" || direction == "horizontal" || direction == "vertical";
+    return direction == "none" || direction == "horizontal" || direction == "vertical" ||
+           direction == "radial";
 }
 
-static void validate_style(const Style &style, std::string_view owner, std::vector<std::string> &errors)
+static void validate_style(
+    const Style &style,
+    std::string_view owner,
+    std::vector<std::string> &errors,
+    bool allow_radial_gradient = true)
 {
     auto validate_optional_color = [&](const std::optional<std::string> &value, std::string_view field_name) {
         if (value.has_value() && !is_valid_color(*value)) {
@@ -176,6 +182,31 @@ static void validate_style(const Style &style, std::string_view owner, std::vect
 
     if (style.bg_gradient_direction.has_value() && !is_valid_gradient_direction(*style.bg_gradient_direction)) {
         errors.push_back(std::string(owner) + " has invalid bg_gradient_direction: " + *style.bg_gradient_direction);
+    }
+    const bool has_radial_coordinate =
+        style.bg_gradient_center_x.has_value() || style.bg_gradient_center_y.has_value() ||
+        style.bg_gradient_end_x.has_value() || style.bg_gradient_end_y.has_value();
+    const bool radial_gradient = style.bg_gradient_direction == "radial";
+    if (radial_gradient && !allow_radial_gradient) {
+        errors.push_back(std::string(owner) + " radial gradients are supported only on main styles");
+    }
+    if (has_radial_coordinate && !radial_gradient) {
+        errors.push_back(std::string(owner) + " defines radial coordinates without bg_gradient_direction: radial");
+    }
+    if (radial_gradient) {
+        if (!style.bg_color.has_value() || !style.bg_gradient_color.has_value() ||
+            !style.bg_gradient_center_x.has_value() || !style.bg_gradient_center_y.has_value() ||
+            !style.bg_gradient_end_x.has_value() || !style.bg_gradient_end_y.has_value()) {
+            errors.push_back(std::string(owner) + " radial gradient requires both colors and all center/end coordinates");
+        } else {
+            const int64_t dx = static_cast<int64_t>(*style.bg_gradient_end_x) -
+                               static_cast<int64_t>(*style.bg_gradient_center_x);
+            const int64_t dy = static_cast<int64_t>(*style.bg_gradient_end_y) -
+                               static_cast<int64_t>(*style.bg_gradient_center_y);
+            if (dx == 0 && dy == 0) {
+                errors.push_back(std::string(owner) + " radial gradient requires a non-zero radius");
+            }
+        }
     }
     if (style.bg_main_stop.has_value() && (*style.bg_main_stop < 0 || *style.bg_main_stop > 255)) {
         errors.push_back(std::string(owner) + " has invalid bg_main_stop");
@@ -225,7 +256,7 @@ static void validate_state_styles(
         if (style.image_font_size.has_value()) {
             errors.push_back(std::string(owner) + " stateStyles." + state_name + " must not set imageFontSize");
         }
-        validate_style(style, std::string(owner) + " stateStyles." + state_name, errors);
+        validate_style(style, std::string(owner) + " stateStyles." + state_name, errors, false);
     }
 }
 
@@ -247,7 +278,7 @@ static void validate_style_set(const StyleSet &style_set, std::string_view owner
         if (part_style.style.image_font_size.has_value()) {
             errors.push_back(std::string(owner) + " partStyles." + part_name + " must not set imageFontSize");
         }
-        validate_style(part_style.style, std::string(owner) + " partStyles." + part_name, errors);
+        validate_style(part_style.style, std::string(owner) + " partStyles." + part_name, errors, false);
         validate_state_styles(part_style.state_styles, std::string(owner) + " partStyles." + part_name, errors);
     }
 }
@@ -436,7 +467,7 @@ static void validate_node(
         if (part_style.style.image_font_size.has_value()) {
             errors.push_back("Node '" + node.id + "' partStyles." + part_name + " must not set imageFontSize");
         }
-        validate_style(part_style.style, "Node '" + node.id + "' partStyles." + part_name, errors);
+        validate_style(part_style.style, "Node '" + node.id + "' partStyles." + part_name, errors, false);
         validate_state_styles(part_style.state_styles, "Node '" + node.id + "' partStyles." + part_name, errors);
     }
 

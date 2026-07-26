@@ -1060,6 +1060,49 @@ const lv_font_t *get_font(BackendImpl &impl, Record &record, const ResolvedStyle
 
 static std::optional<lv_grad_dir_t> parse_gradient_direction(std::string_view direction);
 
+static bool configure_radial_background_gradient(Record &record, const ResolvedStyle &style)
+{
+    const auto &fields = style.style;
+    if (!fields.bg_color.has_value() || !fields.bg_gradient_color.has_value() ||
+        !fields.bg_gradient_center_x.has_value() || !fields.bg_gradient_center_y.has_value() ||
+        !fields.bg_gradient_end_x.has_value() || !fields.bg_gradient_end_y.has_value()) {
+        BROOKESIA_LOGW("Radial gradient is incomplete for node '%1%'", record.absolute_path);
+        return false;
+    }
+
+    const auto start_color = parse_color(*fields.bg_color);
+    const auto end_color = parse_color(*fields.bg_gradient_color);
+    if (!start_color.has_value() || !end_color.has_value()) {
+        BROOKESIA_LOGW("Radial gradient has invalid colors for node '%1%'", record.absolute_path);
+        return false;
+    }
+
+    record.background_gradient = {};
+    lv_grad_radial_init(
+        &record.background_gradient,
+        *fields.bg_gradient_center_x,
+        *fields.bg_gradient_center_y,
+        *fields.bg_gradient_end_x,
+        *fields.bg_gradient_end_y,
+        LV_GRAD_EXTEND_PAD
+    );
+    const lv_color_t colors[] = {
+        lv_color_hex(*start_color),
+        lv_color_hex(*end_color),
+    };
+    const lv_opa_t opacities[] = {
+        LV_OPA_COVER,
+        static_cast<lv_opa_t>(fields.bg_gradient_opacity.value_or(255)),
+    };
+    const uint8_t stops[] = {
+        static_cast<uint8_t>(fields.bg_main_stop.value_or(0)),
+        static_cast<uint8_t>(fields.bg_gradient_stop.value_or(255)),
+    };
+    lv_grad_init_stops(&record.background_gradient, colors, opacities, stops, 2);
+    lv_style_set_bg_grad(&record.style, &record.background_gradient);
+    return true;
+}
+
 static void apply_style_colors(Record &record, const ResolvedStyle &style)
 {
     lv_style_set_bg_opa(&record.style, LV_OPA_TRANSP);
@@ -1082,9 +1125,13 @@ static void apply_style_colors(Record &record, const ResolvedStyle &style)
         lv_style_remove_prop(&record.style, LV_STYLE_BG_GRAD_COLOR);
         lv_style_remove_prop(&record.style, LV_STYLE_BG_GRAD_OPA);
     }
+    lv_style_remove_prop(&record.style, LV_STYLE_BG_GRAD);
     if (style.style.bg_gradient_direction.has_value()) {
         auto direction = parse_gradient_direction(*style.style.bg_gradient_direction);
-        if (direction.has_value()) {
+        if (direction.has_value() && *direction == LV_GRAD_DIR_RADIAL) {
+            (void)configure_radial_background_gradient(record, style);
+            lv_style_remove_prop(&record.style, LV_STYLE_BG_GRAD_DIR);
+        } else if (direction.has_value()) {
             lv_style_set_bg_grad_dir(&record.style, *direction);
         }
     } else {
@@ -1307,6 +1354,9 @@ static std::optional<lv_grad_dir_t> parse_gradient_direction(std::string_view di
     if (direction == "vertical") {
         return LV_GRAD_DIR_VER;
     }
+    if (direction == "radial") {
+        return LV_GRAD_DIR_RADIAL;
+    }
     return std::nullopt;
 }
 
@@ -1322,7 +1372,9 @@ static void apply_state_style_fields(lv_style_t &lv_style, const Style &style)
 
     if (style.bg_gradient_direction.has_value()) {
         auto direction = parse_gradient_direction(*style.bg_gradient_direction);
-        if (direction.has_value()) {
+        if (direction.has_value() && *direction == LV_GRAD_DIR_RADIAL) {
+            BROOKESIA_LOGW("Radial gradients are supported only on a node's main style");
+        } else if (direction.has_value()) {
             lv_style_set_bg_grad_dir(&lv_style, *direction);
         }
     }

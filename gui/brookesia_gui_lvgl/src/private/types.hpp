@@ -101,6 +101,7 @@ struct Record {
     Layout layout;
     Placement placement;
     lv_style_t style {};
+    lv_grad_dsc_t background_gradient {};
     bool style_initialized = false;
     struct StateStyleRecord {
         lv_style_t style {};
