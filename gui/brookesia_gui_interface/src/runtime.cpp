@@ -6023,13 +6023,28 @@ private:
 
         const bool previous_suppress = suppress_binding_listener_apply_;
         suppress_binding_listener_apply_ = true;
+        std::vector<const BindingValueUpdate *> changed_updates;
+        changed_updates.reserve(updates.size());
         for (const auto &update : updates) {
+            const auto previous = store->get_string(
+                document_id,
+                update.absolute_path,
+                update.key
+            );
+            if (previous.has_value() && *previous == update.value) {
+                continue;
+            }
             store->set_string(document_id, update.absolute_path, update.key, update.value);
+            changed_updates.push_back(&update);
         }
         suppress_binding_listener_apply_ = previous_suppress;
+        if (changed_updates.empty()) {
+            return;
+        }
 
         boost::unordered_flat_map<uint64_t, BindingApplyMasks> dirty_nodes;
-        for (const auto &update : updates) {
+        for (const BindingValueUpdate *changed_update : changed_updates) {
+            const auto &update = *changed_update;
             const auto query = normalize_absolute_path(update.absolute_path);
             auto uid = resolve_any_uid(*tree, query);
             if (!uid.has_value()) {

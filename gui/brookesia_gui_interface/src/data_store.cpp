@@ -86,8 +86,17 @@ void MemoryDataStore::set_string(std::string_view key, std::string value)
     std::shared_ptr<Impl::Signal> signal;
     {
         boost::lock_guard lock(impl_->mutex);
-        impl_->values[key_string] = std::move(value);
-        stored_value = impl_->values.at(key_string);
+        auto value_it = impl_->values.find(key_string);
+        if (value_it != impl_->values.end() &&
+            value_it->second == value) {
+            return;
+        }
+        if (value_it == impl_->values.end()) {
+            value_it = impl_->values.emplace(key_string, std::move(value)).first;
+        } else {
+            value_it->second = std::move(value);
+        }
+        stored_value = value_it->second;
 
         auto signal_it = impl_->signals.find(key_string);
         if (signal_it != impl_->signals.end()) {
