@@ -822,6 +822,9 @@ std::optional<uint32_t> style_part_selector(std::string_view part)
     if (part == "knob") {
         return LV_PART_KNOB;
     }
+    if (part == "selected") {
+        return LV_PART_SELECTED;
+    }
     return std::nullopt;
 }
 
@@ -1500,14 +1503,14 @@ static void reset_part_styles(Record &record)
 {
     for (auto &[unused_part, part_style] : record.part_styles) {
         (void)unused_part;
-        if (record.object != nullptr) {
-            lv_obj_remove_style(record.object, &part_style.style, part_style.selector);
+        if (part_style.target_object != nullptr && lv_obj_is_valid(part_style.target_object)) {
+            lv_obj_remove_style(part_style.target_object, &part_style.style, part_style.selector);
         }
         lv_style_reset(&part_style.style);
         for (auto &[unused_state, state_style] : part_style.state_styles) {
             (void)unused_state;
-            if (record.object != nullptr) {
-                lv_obj_remove_style(record.object, &state_style.style, state_style.selector);
+            if (part_style.target_object != nullptr && lv_obj_is_valid(part_style.target_object)) {
+                lv_obj_remove_style(part_style.target_object, &state_style.style, state_style.selector);
             }
             lv_style_reset(&state_style.style);
         }
@@ -1543,11 +1546,34 @@ static void apply_part_styles(Record &record, const ResolvedStyle &style)
             continue;
         }
 
+        lv_obj_t *target_object = record.object;
+        if (part_name == "selected") {
+            if (record.type != NodeType::Dropdown) {
+                BROOKESIA_LOGW(
+                    "Skipping dropdown-only style part '%1%' for node '%2%'",
+                    part_name,
+                    record.absolute_path
+                );
+                continue;
+            }
+            // LVGL renders selected dropdown rows on the popup list object.
+            target_object = lv_dropdown_get_list(record.object);
+        }
+        if (target_object == nullptr) {
+            BROOKESIA_LOGW(
+                "Skipping style part '%1%' because its target is unavailable for node '%2%'",
+                part_name,
+                record.absolute_path
+            );
+            continue;
+        }
+
         auto &entry = record.part_styles[part_name];
         entry.selector = *part_selector;
+        entry.target_object = target_object;
         lv_style_init(&entry.style);
         apply_state_style_fields(entry.style, part_style.style);
-        lv_obj_add_style(record.object, &entry.style, entry.selector);
+        lv_obj_add_style(entry.target_object, &entry.style, entry.selector);
 
         for (const auto &[state_name, state_style] : part_style.state_styles) {
             auto selector = style_state_selector(state_name, *part_selector);
@@ -1564,7 +1590,7 @@ static void apply_part_styles(Record &record, const ResolvedStyle &style)
             state_entry.selector = *selector;
             lv_style_init(&state_entry.style);
             apply_state_style_fields(state_entry.style, state_style);
-            lv_obj_add_style(record.object, &state_entry.style, state_entry.selector);
+            lv_obj_add_style(entry.target_object, &state_entry.style, state_entry.selector);
         }
     }
 }
@@ -1728,6 +1754,12 @@ void apply_style(BackendImpl &impl, Record &record, const ResolvedStyle &style, 
     if (full_apply && record.style_initialized) {
         reset_state_styles(record);
         reset_part_styles(record);
+        if (record.type == NodeType::Dropdown) {
+            auto *list = lv_dropdown_get_list(record.object);
+            if (list != nullptr) {
+                lv_obj_remove_style(list, &record.style, LV_PART_MAIN);
+            }
+        }
         lv_obj_remove_style(record.object, &record.style, LV_PART_MAIN);
         lv_style_reset(&record.style);
         record.style_initialized = false;
@@ -1774,6 +1806,13 @@ void apply_style(BackendImpl &impl, Record &record, const ResolvedStyle &style, 
 
     if (full_apply) {
         lv_obj_add_style(record.object, &record.style, LV_PART_MAIN);
+        if (record.type == NodeType::Dropdown) {
+            // The popup is a separate LVGL object, so share the declarative dropdown style with it.
+            auto *list = lv_dropdown_get_list(record.object);
+            if (list != nullptr) {
+                lv_obj_add_style(list, &record.style, LV_PART_MAIN);
+            }
+        }
         apply_state_styles(record, style);
         apply_part_styles(record, style);
         if (record.type == NodeType::Arc) {

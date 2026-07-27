@@ -351,6 +351,9 @@ refers to other parts of the same view. Currently supported:
    * - ``knob``
      - ``slider`` / ``arc``
      - drag handle
+   * - ``selected``
+     - ``dropdown``
+     - selected row in the popup list; the popup itself inherits the dropdown's main ``style``
 
 Both a direct style shorthand and ``style + stateStyles`` are supported:
 

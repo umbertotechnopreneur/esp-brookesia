@@ -111,6 +111,7 @@ struct Record {
     struct PartStyleRecord {
         lv_style_t style {};
         uint32_t selector = 0;
+        lv_obj_t *target_object = nullptr;
         std::unordered_map<std::string, StateStyleRecord> state_styles;
     };
     std::unordered_map<std::string, PartStyleRecord> part_styles;
