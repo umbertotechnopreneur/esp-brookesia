@@ -332,7 +332,7 @@ inline bool is_supported_style_state_name(std::string_view state)
 
 inline bool is_supported_style_part_name(std::string_view part)
 {
-    return part == "indicator" || part == "knob";
+    return part == "indicator" || part == "knob" || part == "selected";
 }
 
 struct ImageFontGlyph {
