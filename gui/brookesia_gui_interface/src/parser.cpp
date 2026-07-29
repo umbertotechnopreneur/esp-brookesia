@@ -4029,7 +4029,7 @@ static std::expected<void, std::string> apply_interaction_template_object(
     return prepend_array_defaults(target, interaction, "animations");
 }
 
-static std::expected<boost::json::object, std::string> apply_interaction_templates(
+static std::expected<std::optional<boost::json::object>, std::string> apply_interaction_templates(
     const boost::json::object &source,
     const InteractionTemplateRawMap &interactions)
 {
@@ -4037,6 +4037,10 @@ static std::expected<boost::json::object, std::string> apply_interaction_templat
     if (!refs) {
         return std::unexpected(refs.error());
     }
+    if (refs->empty()) {
+        return std::nullopt;
+    }
+
     boost::json::object target = source;
     for (auto it = refs->rbegin(); it != refs->rend(); ++it) {
         auto interaction_it = interactions.find(*it);
@@ -4048,7 +4052,7 @@ static std::expected<boost::json::object, std::string> apply_interaction_templat
             return std::unexpected(apply_result.error());
         }
     }
-    return target;
+    return std::optional<boost::json::object>(std::move(target));
 }
 
 static std::expected<Node, std::string> parse_view_node(
@@ -4065,7 +4069,8 @@ static std::expected<Node, std::string> parse_view_node(
     if (!interaction_object) {
         return std::unexpected(interaction_object.error());
     }
-    const auto &object = *interaction_object;
+    const boost::json::object &object =
+        interaction_object->has_value() ? interaction_object->value() : source_object;
 
     BROOKESIA_LOGD("Params: object(keys=%1%), environment(%2%)", object.size(), environment);
 
@@ -5631,6 +5636,8 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
             }
         }
     }
+    // All root assets are now owned by asset_entries; release the parsed root before resolving them.
+    json_value = nullptr;
     stage_end = ParserProfileClock::now();
     GUI_INTERFACE_PROFILE_LOGI(
         "GUI parser profile: base_dir(%1%), stage(load_asset_entries), assets(%2%), dependencies(%3%), "
@@ -5674,7 +5681,6 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
         merge_json(constants, *data_value);
     }
 
-    document.constants = constants;
     stage_end = ParserProfileClock::now();
     GUI_INTERFACE_PROFILE_LOGI(
         "GUI parser profile: base_dir(%1%), stage(resolve_constants), assets(%2%), elapsed_ms(%3%), total_ms(%4%)",
@@ -5686,7 +5692,8 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
 
     stage_start = ParserProfileClock::now();
     std::vector<ResolvedAssetEntry> resolved_assets;
-    for (const auto &asset_entry : asset_entries) {
+    resolved_assets.reserve(asset_entries.size());
+    for (auto &asset_entry : asset_entries) {
         const auto &asset_object = asset_entry.value.as_object();
         auto asset_type = parse_string_field(asset_object, "type");
         if (!asset_type) {
@@ -5698,7 +5705,8 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
             continue;
         }
 
-        auto resolved_asset = asset_entry.value;
+        // This is the final asset_entries pass, so transfer the JSON tree instead of duplicating it.
+        auto resolved_asset = std::move(asset_entry.value);
         auto replace_result = substitute_references(resolved_asset, constants, environment);
         if (!replace_result) {
             return std::unexpected(
@@ -5713,6 +5721,8 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
             .type = *asset_type,
         });
     }
+    asset_entries.clear();
+    asset_entries.shrink_to_fit();
     stage_end = ParserProfileClock::now();
     GUI_INTERFACE_PROFILE_LOGI(
         "GUI parser profile: base_dir(%1%), stage(resolve_assets), resolved_assets(%2%), elapsed_ms(%3%), "
@@ -5724,9 +5734,7 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
     );
 
     stage_start = ParserProfileClock::now();
-    for (const auto &asset_entry : resolved_assets) {
-        const auto &resolved_asset_object = asset_entry.value.as_object();
-
+    for (auto &asset_entry : resolved_assets) {
         if (asset_entry.type == "font" || asset_entry.type == "fontSet") {
             return std::unexpected(
                        "Document asset type '" + asset_entry.type +
@@ -5741,6 +5749,7 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
         }
 
         if (asset_entry.type == "imageSet") {
+            const auto &resolved_asset_object = asset_entry.value.as_object();
             auto images = parse_image_asset_set(resolved_asset_object, asset_entry.base_dir);
             if (!images) {
                 return std::unexpected(
@@ -5748,6 +5757,7 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
                        );
             }
             std::move(images->begin(), images->end(), std::back_inserter(document.images));
+            asset_entry.value = nullptr;
             continue;
         }
 
@@ -5768,11 +5778,11 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
     );
 
     stage_start = ParserProfileClock::now();
-    for (const auto &asset_entry : resolved_assets) {
-        const auto &resolved_asset_object = asset_entry.value.as_object();
+    for (auto &asset_entry : resolved_assets) {
         if (asset_entry.type != "styleSet") {
             continue;
         }
+        const auto &resolved_asset_object = asset_entry.value.as_object();
         const auto *styles_value = find_child_value(resolved_asset_object, "styles");
         if (styles_value == nullptr || !styles_value->is_object()) {
             return std::unexpected(
@@ -5789,7 +5799,9 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
         for (auto &[key, style] : *styles) {
             document.styles.insert_or_assign(std::move(key), std::move(style));
         }
+        asset_entry.value = nullptr;
     }
+    document.constants = std::move(constants);
     stage_end = ParserProfileClock::now();
     GUI_INTERFACE_PROFILE_LOGI(
         "GUI parser profile: base_dir(%1%), stage(parse_style_assets), styles(%2%), elapsed_ms(%3%), total_ms(%4%)",
@@ -5801,18 +5813,18 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
 
     stage_start = ParserProfileClock::now();
     InteractionTemplateRawMap raw_interactions;
-    for (const auto &asset_entry : resolved_assets) {
-        const auto &resolved_asset_object = asset_entry.value.as_object();
+    for (auto &asset_entry : resolved_assets) {
         if (asset_entry.type != "interactionTemplate") {
             continue;
         }
+        const auto &resolved_asset_object = asset_entry.value.as_object();
         auto id = parse_string_field(resolved_asset_object, "id");
         if (!id) {
             return std::unexpected(
                        "Failed to parse interactionTemplate asset '" + asset_entry.source_label + "': " + id.error()
                    );
         }
-        auto interaction_object = resolved_asset_object;
+        auto interaction_object = std::move(asset_entry.value.as_object());
         for (const auto &entry : interaction_object) {
             const auto normalized_key = normalize_object_key(entry.key());
             if (normalized_key == "type" || normalized_key == "id" || normalized_key == "common_props" ||
@@ -5843,8 +5855,9 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
 
     stage_start = ParserProfileClock::now();
     TemplateRawMap raw_templates;
-    for (const auto &asset_entry : resolved_assets) {
-        const auto &resolved_asset_object = asset_entry.value.as_object();
+    std::vector<std::pair<std::string, std::string>> template_entries;
+    template_entries.reserve(resolved_assets.size());
+    for (auto &asset_entry : resolved_assets) {
         if (asset_entry.type == "imageSet" || asset_entry.type == "interactionTemplate" ||
                 asset_entry.type == "styleSet") {
             continue;
@@ -5857,20 +5870,21 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
         if (asset_entry.type != "viewTemplate") {
             continue;
         }
+        auto &resolved_asset_object = asset_entry.value.as_object();
         auto id = parse_string_field(resolved_asset_object, "id");
         if (!id) {
             return std::unexpected(
                        "Failed to parse viewTemplate asset '" + asset_entry.source_label + "': " + id.error()
                    );
         }
-        const auto *node_value = find_child_value(resolved_asset_object, "node");
-        if (node_value == nullptr || !node_value->is_object()) {
+        auto node_it = find_key(resolved_asset_object, "node");
+        if (node_it == resolved_asset_object.end() || !node_it->value().is_object()) {
             return std::unexpected(
                        "Failed to parse viewTemplate asset '" + asset_entry.source_label +
                        "': viewTemplate must contain object field 'node'"
-                   );
+                       );
         }
-        auto node_object = node_value->as_object();
+        auto node_object = std::move(node_it->value().as_object());
         if (find_child_value(node_object, "id") != nullptr) {
             return std::unexpected(
                        "Failed to parse viewTemplate asset '" + asset_entry.source_label +
@@ -5878,33 +5892,27 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
                    );
         }
         node_object.insert_or_assign("id", *id);
-        auto [unused_it, inserted] = raw_templates.emplace(*id, node_object);
+        auto [unused_it, inserted] = raw_templates.emplace(*id, std::move(node_object));
         if (!inserted) {
             return std::unexpected("Duplicate viewTemplate id: " + *id);
         }
+        template_entries.emplace_back(*id, asset_entry.source_label);
+        asset_entry.value = nullptr;
     }
 
-    for (const auto &asset_entry : resolved_assets) {
-        const auto &resolved_asset_object = asset_entry.value.as_object();
-        if (asset_entry.type == "imageSet" || asset_entry.type == "interactionTemplate" ||
-                asset_entry.type == "styleSet") {
-            continue;
-        }
-        if (asset_entry.type != "viewTemplate") {
-            continue;
-        }
+    for (const auto &[template_id, source_label] : template_entries) {
         std::vector<std::string> template_stack;
-        auto template_object = raw_templates.at(std::string(resolved_asset_object.at("id").as_string().c_str()));
+        auto template_object = raw_templates.at(template_id);
         auto slot_result = apply_template_slots(template_object, nullptr);
         if (!slot_result) {
             return std::unexpected(
-                       "Failed to parse viewTemplate asset '" + asset_entry.source_label + "': " + slot_result.error()
+                       "Failed to parse viewTemplate asset '" + source_label + "': " + slot_result.error()
                    );
         }
         auto node = parse_view_node(template_object, environment, raw_templates, raw_interactions, template_stack);
         if (!node) {
             return std::unexpected(
-                       "Failed to parse viewTemplate asset '" + asset_entry.source_label + "': " + node.error()
+                       "Failed to parse viewTemplate asset '" + source_label + "': " + node.error()
                    );
         }
         if (node->type == NodeType::Screen) {
@@ -5924,13 +5932,13 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
     );
 
     stage_start = ParserProfileClock::now();
-    for (const auto &asset_entry : resolved_assets) {
-        const auto &resolved_asset_object = asset_entry.value.as_object();
+    for (auto &asset_entry : resolved_assets) {
         if (asset_entry.type == "imageSet" || asset_entry.type == "interactionTemplate" ||
                 asset_entry.type == "styleSet") {
             continue;
         }
         if (asset_entry.type == "screenFlow") {
+            const auto &resolved_asset_object = asset_entry.value.as_object();
             auto flow = parse_screen_flow(resolved_asset_object);
             if (!flow) {
                 return std::unexpected(
@@ -5938,6 +5946,7 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
                        );
             }
             document.screen_flows.push_back(std::move(*flow));
+            asset_entry.value = nullptr;
             continue;
         }
         if (asset_entry.type == "viewTemplate") {
@@ -5949,6 +5958,13 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
                    );
         }
 
+        const auto &resolved_asset_object = asset_entry.value.as_object();
+        GUI_INTERFACE_PROFILE_LOGI(
+            "GUI parser profile: base_dir(%1%), stage(parse_screen_start), asset(%2%), completed(%3%)",
+            base_dir,
+            asset_entry.source_label,
+            document.screens.size()
+        );
         std::vector<std::string> template_stack;
         auto node = parse_view_node(
                         resolved_asset_object,
@@ -5964,7 +5980,20 @@ static std::expected<ParsedDocument, std::string> parse_document_impl(
                    );
         }
         document.screens.push_back(std::move(*node));
+        GUI_INTERFACE_PROFILE_LOGI(
+            "GUI parser profile: base_dir(%1%), stage(parse_screen_done), asset(%2%), completed(%3%)",
+            base_dir,
+            asset_entry.source_label,
+            document.screens.size()
+        );
+        asset_entry.value = nullptr;
     }
+    resolved_assets.clear();
+    resolved_assets.shrink_to_fit();
+    raw_templates.clear();
+    raw_interactions.clear();
+    template_entries.clear();
+    template_entries.shrink_to_fit();
     stage_end = ParserProfileClock::now();
     GUI_INTERFACE_PROFILE_LOGI(
         "GUI parser profile: base_dir(%1%), stage(parse_flows_screens), flows(%2%), screens(%3%), "
