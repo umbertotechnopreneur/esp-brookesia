@@ -155,7 +155,7 @@ struct Record {
         std::vector<const char *> map;
         std::vector<lv_buttonmatrix_ctrl_t> controls;
     };
-    std::array<KeyboardLayoutStorage, 4> keyboard_layouts;
+    std::array<std::shared_ptr<KeyboardLayoutStorage>, 4> keyboard_layouts;
     std::vector<std::string> keyboard_allowed_modes;
     std::unordered_map<std::string, KeyboardKeyStyle> keyboard_key_styles;
     std::unordered_map<uint32_t, lv_area_t> keyboard_key_fill_areas;
@@ -293,7 +293,6 @@ public:
     std::unordered_map<std::string, RuntimeFontResource> font_resources;
     std::unordered_map<std::string, BinaryImageCacheEntry> binary_image_cache;
     std::unordered_map<std::string, BinaryImageCacheEntry> decoded_image_cache;
-    std::vector<std::shared_ptr<Record::KeyboardLayoutStorage>> keyboard_layout_backing_store;
     std::unordered_map<char, FontAssetsMountRecord> font_asset_mounts;
     std::unordered_map<char, ImageAssetsMountRecord> image_asset_mounts;
     std::unordered_map<BackendHandle::Value, MountTarget> mounted_targets;

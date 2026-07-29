@@ -143,7 +143,8 @@ static bool has_keyboard_layout(const Record &record, std::string_view mode)
     if (!index.has_value()) {
         return false;
     }
-    return !record.keyboard_layouts[*index].map.empty();
+    const auto &storage = record.keyboard_layouts[*index];
+    return storage != nullptr && !storage->map.empty();
 }
 
 static Record *find_record_by_absolute_path(BackendImpl &impl, std::string_view absolute_path)
@@ -262,7 +263,11 @@ static std::optional<KeyboardKey> keyboard_key_from_selected_button(Record &reco
     if (!index.has_value()) {
         return std::nullopt;
     }
-    const auto &keys = record.keyboard_layouts[*index].keys;
+    const auto &storage = record.keyboard_layouts[*index];
+    if (storage == nullptr) {
+        return std::nullopt;
+    }
+    const auto &keys = storage->keys;
     if (selected_button >= keys.size()) {
         return std::nullopt;
     }
@@ -607,8 +612,7 @@ static void apply_keyboard_layouts(BackendImpl &impl, Record &record, const Keyb
             storage.map.data(),
             storage.controls.data()
         );
-        record.keyboard_layouts[*index] = storage;
-        impl.keyboard_layout_backing_store.push_back(std::move(storage_owner));
+        record.keyboard_layouts[*index] = std::move(storage_owner);
     }
 
     if (!record.keyboard_event_registered) {

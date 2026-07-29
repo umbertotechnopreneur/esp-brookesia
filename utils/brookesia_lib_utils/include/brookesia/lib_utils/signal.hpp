@@ -27,8 +27,27 @@ namespace esp_brookesia::lib_utils {
 
 namespace signal_detail {
 
+struct SlotControl;
+
+class SlotOwner {
+public:
+    virtual ~SlotOwner() = default;
+    virtual void disconnect_slot(const SlotControl *control) noexcept = 0;
+};
+
 struct SlotControl {
     std::atomic<bool> connected{true};
+    std::weak_ptr<SlotOwner> owner;
+
+    void disconnect() noexcept
+    {
+        if (!connected.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        if (auto locked_owner = owner.lock()) {
+            locked_owner->disconnect_slot(this);
+        }
+    }
 };
 
 } // namespace signal_detail
@@ -53,7 +72,7 @@ public:
     void disconnect() const noexcept
     {
         if (auto control = control_.lock()) {
-            control->connected.store(false, std::memory_order_release);
+            control->disconnect();
         }
     }
 
@@ -136,26 +155,26 @@ class signal<void(Args...)> {
 public:
     using slot_type = std::function<void(Args...)>;
 
-    signal() = default;
+    signal() : state_(std::make_shared<State>()) {}
     signal(const signal &) = delete;
     signal &operator=(const signal &) = delete;
 
     // Non-copyable but movable, matching boost::signals2::signal. Existing connections
-    // stay valid across a move because they reference the per-slot control block, which
-    // travels with the slot entries.
-    signal(signal &&other) noexcept
-    {
-        std::lock_guard<std::mutex> lock(other.mutex_);
-        slots_ = std::move(other.slots_);
-    }
+    // stay valid across a move because the shared slot state moves with them.
+    signal(signal &&other) noexcept : state_(std::move(other.state_)) {}
 
     signal &operator=(signal &&other) noexcept
     {
         if (this != &other) {
-            std::scoped_lock lock(mutex_, other.mutex_);
-            slots_ = std::move(other.slots_);
+            disconnect_all_slots();
+            state_ = std::move(other.state_);
         }
         return *this;
+    }
+
+    ~signal()
+    {
+        disconnect_all_slots();
     }
 
     /**
@@ -163,11 +182,21 @@ public:
      */
     connection connect(slot_type slot)
     {
-        auto control = std::make_shared<signal_detail::SlotControl>();
-        auto entry = std::make_shared<Slot>(Slot{control, std::move(slot)});
-        std::lock_guard<std::mutex> lock(mutex_);
-        slots_.push_back(std::move(entry));
-        return connection{control};
+        auto state = state_;
+        if (state == nullptr) {
+            state = std::make_shared<State>();
+            state_ = state;
+        }
+
+        auto entry = std::make_shared<Slot>(std::move(slot));
+        entry->owner = state;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->slots.push_back(entry);
+        }
+        return connection{
+            std::static_pointer_cast<signal_detail::SlotControl>(entry)
+        };
     }
 
     /**
@@ -179,23 +208,21 @@ public:
      */
     void operator()(Args... args) const
     {
+        const auto state = state_;
+        if (state == nullptr) {
+            return;
+        }
+
         std::vector<std::shared_ptr<Slot>> snapshot;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            snapshot = slots_;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            snapshot = state->slots;
         }
 
-        bool stale = false;
         for (const auto &entry : snapshot) {
-            if (entry->control->connected.load(std::memory_order_acquire)) {
+            if (entry->connected.load(std::memory_order_acquire)) {
                 entry->fn(args...);
-            } else {
-                stale = true;
             }
-        }
-
-        if (stale) {
-            prune();
         }
     }
 
@@ -204,11 +231,19 @@ public:
      */
     void disconnect_all_slots()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &entry : slots_) {
-            entry->control->connected.store(false, std::memory_order_release);
+        const auto state = state_;
+        if (state == nullptr) {
+            return;
         }
-        slots_.clear();
+
+        std::vector<std::shared_ptr<Slot>> disconnected;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            for (const auto &entry : state->slots) {
+                entry->connected.store(false, std::memory_order_release);
+            }
+            disconnected.swap(state->slots);
+        }
     }
 
     /**
@@ -216,10 +251,15 @@ public:
      */
     std::size_t num_slots() const
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        const auto state = state_;
+        if (state == nullptr) {
+            return 0;
+        }
+
+        std::lock_guard<std::mutex> lock(state->mutex);
         std::size_t count = 0;
-        for (const auto &entry : slots_) {
-            if (entry->control->connected.load(std::memory_order_acquire)) {
+        for (const auto &entry : state->slots) {
+            if (entry->connected.load(std::memory_order_acquire)) {
                 ++count;
             }
         }
@@ -232,25 +272,36 @@ public:
     }
 
 private:
-    struct Slot {
-        std::shared_ptr<signal_detail::SlotControl> control;
+    struct Slot final : signal_detail::SlotControl {
+        explicit Slot(slot_type callback) : fn(std::move(callback)) {}
+
         slot_type fn;
     };
 
-    void prune() const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = slots_.begin(); it != slots_.end();) {
-            if ((*it)->control->connected.load(std::memory_order_acquire)) {
-                ++it;
-            } else {
-                it = slots_.erase(it);
+    struct State final : signal_detail::SlotOwner {
+        void disconnect_slot(
+            const signal_detail::SlotControl *control
+        ) noexcept override
+        {
+            std::shared_ptr<Slot> disconnected;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (auto it = slots.begin(); it != slots.end(); ++it) {
+                    if (static_cast<signal_detail::SlotControl *>(it->get()) ==
+                        control) {
+                        disconnected = std::move(*it);
+                        slots.erase(it);
+                        break;
+                    }
+                }
             }
         }
-    }
 
-    mutable std::mutex mutex_;
-    mutable std::vector<std::shared_ptr<Slot>> slots_;
+        mutable std::mutex mutex;
+        std::vector<std::shared_ptr<Slot>> slots;
+    };
+
+    std::shared_ptr<State> state_;
 };
 
 } // namespace esp_brookesia::lib_utils

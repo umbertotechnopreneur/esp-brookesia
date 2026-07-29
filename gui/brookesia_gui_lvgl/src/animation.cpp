@@ -155,8 +155,9 @@ static void runtime_animation_completed_cb(lv_anim_t *lv_anim)
     auto active = context->active;
     if (active != nullptr && *active) {
         *active = false;
-        if (context->completed_handler) {
-            context->completed_handler();
+        auto completed_handler = std::move(context->completed_handler);
+        if (completed_handler) {
+            completed_handler();
         }
     }
 }
@@ -274,7 +275,9 @@ std::optional<BackendAnimationStartResult> start_animation(
     lv_anim_set_path_cb(&lv_anim, to_lvgl_anim_path(animation.easing));
     lv_anim_set_user_data(&lv_anim, context.get());
     lv_anim_set_completed_cb(&lv_anim, runtime_animation_completed_cb);
-    lv_anim_start(&lv_anim);
+    if (lv_anim_start(&lv_anim) == nullptr) {
+        return std::nullopt;
+    }
 
     BackendAnimationStartResult result;
     result.resolved_from = from;

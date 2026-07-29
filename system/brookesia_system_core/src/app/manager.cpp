@@ -968,7 +968,6 @@ std::expected<void, std::string> System::stop_app(AppId app_id)
         (void)hide_app_keyboard(app_id, request_id);
     }
     close_message_dialogs_for_app(app_id);
-    impl_->cancel_app_timers(record);
     std::expected<void, std::string> stop_result = {};
     if (record.info.manifest.kind == AppKind::Native) {
         if (record.native_app && record.context) {
@@ -1009,6 +1008,9 @@ std::expected<void, std::string> System::stop_app(AppId app_id)
         }
         record.runtime_started = false;
     }
+    // AppState::Stopping already prevents timer dispatch. Let the app release
+    // its own timer IDs first, then enforce cleanup even if on_stop() failed.
+    impl_->cancel_app_timers(record);
     auto cleanup_result = impl_->run_task_sync<std::expected<void, std::string>>(
                               SYSTEM_GUI_TASK_GROUP,
     [this, &record]() -> std::expected<void, std::string> {

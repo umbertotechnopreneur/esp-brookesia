@@ -1655,20 +1655,16 @@ public:
         pop_transient_screens_for_document(document_id);
         stop_screen_flows_for_document(document_id);
         const auto event_animation_prefix = std::to_string(document_id.value()) + '\x1f';
-        std::vector<std::string> event_animation_keys;
-        for (const auto &[key, unused_subscription_id] : event_animation_ids_) {
-            (void)unused_subscription_id;
-            if (key.rfind(event_animation_prefix, 0) == 0) {
-                event_animation_keys.push_back(key);
-            }
-        }
-        for (const auto &key : event_animation_keys) {
-            auto animation_it = event_animation_ids_.find(key);
-            if (animation_it == event_animation_ids_.end()) {
+        for (auto animation_it = event_animation_ids_.begin();
+             animation_it != event_animation_ids_.end();) {
+            if (animation_it->first.rfind(event_animation_prefix, 0) != 0) {
+                ++animation_it;
                 continue;
             }
-            (void)unsubscribe_subscription(animation_it->second);
-            event_animation_ids_.erase(key);
+            const auto subscription_id = animation_it->second;
+            const auto erase_it = animation_it++;
+            event_animation_ids_.erase(erase_it);
+            (void)unsubscribe_subscription(subscription_id);
         }
         unload_partial_tree(tree_it->second);
         release_tree_image_resources(tree_it->second);
@@ -1680,41 +1676,42 @@ public:
         // ResolvedStyle entries until that bump, which never happens during normal app open/close.
         {
             const auto style_cache_prefix = std::to_string(document_id.value()) + '\x1f';
-            std::vector<std::string> style_cache_keys_to_erase;
-            for (const auto &[cache_key, unused_resolved] : resolved_style_cache_) {
-                (void)unused_resolved;
-                if (cache_key.compare(0, style_cache_prefix.size(), style_cache_prefix) == 0) {
-                    style_cache_keys_to_erase.push_back(cache_key);
+            for (auto cache_it = resolved_style_cache_.begin();
+                 cache_it != resolved_style_cache_.end();) {
+                if (cache_it->first.compare(
+                        0,
+                        style_cache_prefix.size(),
+                        style_cache_prefix
+                    ) != 0) {
+                    ++cache_it;
+                    continue;
                 }
-            }
-            for (const auto &cache_key : style_cache_keys_to_erase) {
-                resolved_style_cache_.erase(cache_key);
+                const auto erase_it = cache_it++;
+                resolved_style_cache_.erase(erase_it);
             }
         }
 
-        std::vector<std::string> mounted_targets_to_erase;
-        for (const auto &[target_key, mounted_ref] : mounted_screens_) {
-            if (mounted_ref.document_id == document_id) {
-                mounted_targets_to_erase.push_back(target_key);
+        for (auto mounted_it = mounted_screens_.begin();
+             mounted_it != mounted_screens_.end();) {
+            if (mounted_it->second.document_id != document_id) {
+                ++mounted_it;
+                continue;
             }
-        }
-        for (const auto &target_key : mounted_targets_to_erase) {
-            mounted_screens_.erase(target_key);
+            const auto erase_it = mounted_it++;
+            mounted_screens_.erase(erase_it);
         }
 
         {
             std::lock_guard lock(event_action_mutex_);
             const auto prefix = build_event_action_route_prefix(document_id);
-            std::vector<std::string> route_keys;
-            route_keys.reserve(event_action_signals.size());
-            for (const auto &[key, unused_signal] : event_action_signals) {
-                (void)unused_signal;
-                if (key.compare(0, prefix.size(), prefix) == 0) {
-                    route_keys.push_back(key);
+            for (auto route_it = event_action_signals.begin();
+                 route_it != event_action_signals.end();) {
+                if (route_it->first.compare(0, prefix.size(), prefix) != 0) {
+                    ++route_it;
+                    continue;
                 }
-            }
-            for (const auto &key : route_keys) {
-                event_action_signals.erase(key);
+                const auto erase_it = route_it++;
+                event_action_signals.erase(erase_it);
             }
         }
         if (store != nullptr) {
@@ -1724,14 +1721,15 @@ public:
         // fire-and-forget animations whose RuntimeAnimationStartResult was discarded).
         {
             const auto doc_value = document_id.value();
-            std::vector<SubscriptionId> stale_subscriptions;
-            stale_subscriptions.reserve(subscription_document_ids_.size());
-            for (const auto &[subscription_id, owning_doc] : subscription_document_ids_) {
-                if (owning_doc == doc_value) {
-                    stale_subscriptions.push_back(subscription_id);
+            for (auto subscription_it = subscription_document_ids_.begin();
+                 subscription_it != subscription_document_ids_.end();) {
+                if (subscription_it->second != doc_value) {
+                    ++subscription_it;
+                    continue;
                 }
-            }
-            for (auto subscription_id : stale_subscriptions) {
+                const auto subscription_id = subscription_it->first;
+                const auto erase_it = subscription_it++;
+                subscription_document_ids_.erase(erase_it);
                 (void)unsubscribe_subscription(subscription_id);
             }
         }
@@ -4899,6 +4897,10 @@ private:
                                  std::nullopt
                              );
             if (!child_uid) {
+                // A descendant can fail after this node and earlier siblings
+                // were registered. Roll the whole partial subtree back before
+                // propagating the original construction error.
+                destroy_subtree(tree, uid);
                 return std::unexpected(child_uid.error());
             }
         }
@@ -6282,12 +6284,43 @@ private:
                 (void)unsubscribe_subscription(old_subscription_id);
             }
         }
-        auto backend_result = backend->start_animation(target_record->handle, *animation, {});
+        const auto subscription_id = next_subscription_id_++;
+        auto self_releasing_handler =
+            [registry = std::weak_ptr<SubscriptionRegistry>(
+                 subscription_registry_
+             ),
+             impl_self = this,
+             subscription_id,
+             animation_key]() mutable {
+                auto *const self = impl_self;
+                const auto id = subscription_id;
+                auto key = std::move(animation_key);
+                auto locked_registry = registry.lock();
+                if (self != nullptr) {
+                    self->subscription_document_ids_.erase(id);
+                    if (key.has_value()) {
+                        auto it = self->event_animation_ids_.find(*key);
+                        if (it != self->event_animation_ids_.end() &&
+                            it->second == id) {
+                            self->event_animation_ids_.erase(it);
+                        }
+                    }
+                }
+                // Erase the self-owning connection last; this destroys this
+                // closure, so no capture may be accessed afterwards.
+                if (locked_registry != nullptr) {
+                    locked_registry->disconnect_handlers.erase(id);
+                }
+            };
+        auto backend_result = backend->start_animation(
+            target_record->handle,
+            *animation,
+            std::move(self_releasing_handler)
+        );
         if (!backend_result || !backend_result->connection.connected()) {
             return std::unexpected("Failed to start event animation");
         }
         auto connection = std::make_shared<ScopedConnection>(std::move(backend_result->connection));
-        const auto subscription_id = next_subscription_id_++;
         auto disconnect_handler = std::make_shared<std::function<void()>>();
         *disconnect_handler = [registry = std::weak_ptr<SubscriptionRegistry>(subscription_registry_),
                                         subscription_id,

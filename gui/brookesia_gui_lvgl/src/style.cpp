@@ -149,25 +149,59 @@ std::expected<std::shared_ptr<FontCacheEntry::FontSource>, std::string> load_fon
 }
 #endif
 
+constexpr std::size_t kMaxRememberedFontLogMessages = 128;
+
 void log_font_warning_once(std::string_view message)
 {
     static std::unordered_set<std::string> logged_messages;
+    static bool saturation_logged = false;
 
-    const auto [_, inserted] = logged_messages.emplace(message);
-    if (inserted) {
-        BROOKESIA_LOGW("%1%", message);
+    const auto known_message = std::find_if(
+        logged_messages.begin(),
+        logged_messages.end(),
+        [message](const std::string &logged) {
+            return logged == message;
+        }
+    );
+    if (known_message != logged_messages.end()) {
+        return;
     }
+    if (logged_messages.size() >= kMaxRememberedFontLogMessages) {
+        if (!saturation_logged) {
+            saturation_logged = true;
+            BROOKESIA_LOGW("Font warning deduplication cache full; suppressing additional unique warnings");
+        }
+        return;
+    }
+
+    logged_messages.emplace(message);
+    BROOKESIA_LOGW("%1%", message);
 }
 
+#if (BROOKESIA_UTILS_LOG_LEVEL <= BROOKESIA_UTILS_LOG_LEVEL_DEBUG) && \
+    (!BROOKESIA_LOG_DISABLE_DEBUG_TRACE)
 void log_font_info_once(std::string_view message)
 {
     static std::unordered_set<std::string> logged_messages;
 
-    const auto [_, inserted] = logged_messages.emplace(message);
-    if (inserted) {
-        BROOKESIA_LOGD("%1%", message);
+    const auto known_message = std::find_if(
+        logged_messages.begin(),
+        logged_messages.end(),
+        [message](const std::string &logged) {
+            return logged == message;
+        }
+    );
+    if (known_message != logged_messages.end() ||
+            logged_messages.size() >= kMaxRememberedFontLogMessages) {
+        return;
     }
+
+    logged_messages.emplace(message);
+    BROOKESIA_LOGD("%1%", message);
 }
+#else
+#define log_font_info_once(message) ((void)0)
+#endif
 
 const lv_font_t *get_builtin_font(int32_t font_size)
 {
