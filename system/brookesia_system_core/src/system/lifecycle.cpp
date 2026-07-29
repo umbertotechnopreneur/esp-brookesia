@@ -259,7 +259,10 @@ void System::deinit()
                                   SYSTEM_GUI_TASK_GROUP,
         [this, record_ptr, app_id]() -> std::expected<void, std::string> {
             impl_->clear_pending_gui_bindings(app_id);
-            impl_->unload_gui(*record_ptr);
+            auto unload_result = impl_->unload_gui(*record_ptr);
+            if (!unload_result) {
+                return unload_result;
+            }
             impl_->unregister_app_gui_resources(*record_ptr);
             impl_->unregister_app_icon_resource(*record_ptr);
             return {};
@@ -274,10 +277,6 @@ void System::deinit()
             );
         }
     }
-    impl_->apps_.clear();
-    impl_->manifest_id_to_app_.clear();
-    impl_->image_resource_owners_.clear();
-    impl_->font_resource_owners_.clear();
     impl_->system_service_binding_.release();
     impl_->gui_service_binding_.release();
     impl_->timer_service_binding_.release();
@@ -298,7 +297,16 @@ void System::deinit()
     std::unexpected("Failed to post GUI runtime cleanup task")
                               );
     if (!gui_cleanup_result) {
-        BROOKESIA_LOGW("Failed to cleanup GUI runtime while deinitializing system: %1%", gui_cleanup_result.error());
+        BROOKESIA_LOGW(
+            "Failed to cleanup GUI runtime while deinitializing system; "
+            "app document ownership is retained: %1%",
+            gui_cleanup_result.error()
+        );
+    } else {
+        impl_->apps_.clear();
+        impl_->manifest_id_to_app_.clear();
+        impl_->image_resource_owners_.clear();
+        impl_->font_resource_owners_.clear();
     }
     impl_->gui_thread_guard_.reset();
     if (impl_->task_scheduler_) {

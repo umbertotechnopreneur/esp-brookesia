@@ -418,7 +418,22 @@ protected:
         std::string_view resource_dir,
         std::string_view path
     );
+    std::expected<gui::DocumentId, std::string> system_gui_load_file(
+        AppId app_id,
+        std::string_view path
+    );
+    std::expected<gui::DocumentId, std::string> system_gui_load_file(
+        AppId app_id,
+        std::string_view resource_dir,
+        std::string_view path
+    );
     std::expected<gui::DocumentId, std::string> system_gui_load_json(
+        std::string_view root_path,
+        std::string_view json,
+        std::string_view resource_dir
+    );
+    std::expected<gui::DocumentId, std::string> system_gui_load_json(
+        AppId app_id,
         std::string_view root_path,
         std::string_view json,
         std::string_view resource_dir
@@ -430,6 +445,7 @@ protected:
     );
     bool system_gui_unmount_screen(gui::DocumentId document_id, std::string_view absolute_path);
     bool system_gui_unload(gui::DocumentId document_id);
+    bool system_gui_unload(AppId app_id, gui::DocumentId document_id);
     std::expected<void, std::string> system_gui_enable_live_preview(
         gui::DocumentId document_id,
         const gui::LivePreviewOptions &options = {}

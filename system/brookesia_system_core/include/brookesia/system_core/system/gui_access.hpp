@@ -79,6 +79,13 @@ public:
         std::string_view absolute_path,
         std::string_view text
     ) const;
+    std::expected<void, std::string> scroll_to(
+        gui::DocumentId document_id,
+        std::string_view absolute_path,
+        int32_t x,
+        int32_t y,
+        bool animated = true
+    ) const;
     std::expected<void, std::string> set_view_src(
         gui::DocumentId document_id,
         std::string_view absolute_path,

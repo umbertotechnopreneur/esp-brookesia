@@ -73,6 +73,7 @@ function(brookesia_stage_runtime_app_package)
         add_custom_target(${stage_target} ALL
             ${legacy_cleanup_commands}
             COMMAND ${CMAKE_COMMAND} -E make_directory "${stage_root}"
+            COMMAND ${CMAKE_COMMAND} -E remove_directory "${stage_dir}"
             COMMAND ${CMAKE_COMMAND} -E copy_directory "${stage_source_dir}" "${stage_dir}"
             COMMENT "Staging Brookesia runtime app package ${stage_PACKAGE_ID}"
             VERBATIM

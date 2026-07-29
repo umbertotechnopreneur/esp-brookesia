@@ -423,6 +423,45 @@ std::expected<void, std::string> SystemGuiAccess::set_text(
            );
 }
 
+std::expected<void, std::string> SystemGuiAccess::scroll_to(
+    gui::DocumentId document_id,
+    std::string_view absolute_path,
+    int32_t x,
+    int32_t y,
+    bool animated
+) const
+{
+    if (system_ == nullptr) {
+        return make_unavailable_error();
+    }
+    return system_->impl_->run_task_sync<std::expected<void, std::string>>(
+               SYSTEM_GUI_INPUT_TASK_GROUP,
+               [this,
+                document_id,
+                absolute_path = std::string(absolute_path),
+                x,
+                y,
+                animated]() -> std::expected<void, std::string> {
+        if (!system_->impl_->gui_runtime_) {
+            return std::unexpected("GUI runtime is not available");
+        }
+        if (!system_->impl_->gui_runtime_->scroll_view_to(
+                document_id,
+                absolute_path,
+                x,
+                y,
+                animated
+            )) {
+            return std::unexpected(
+                "Failed to scroll system GUI view: " + absolute_path
+            );
+        }
+        return {};
+    },
+    std::unexpected("Failed to post system GUI scroll task")
+           );
+}
+
 std::expected<void, std::string> SystemGuiAccess::set_view_src(
     gui::DocumentId document_id,
     std::string_view absolute_path,

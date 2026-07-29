@@ -59,6 +59,7 @@ public:
         std::shared_ptr<IApp> native_app;
         std::unique_ptr<AppContext> context;
         std::optional<gui::DocumentId> document_id;
+        std::set<gui::DocumentId::Value> auxiliary_document_ids;
         std::optional<runtime::AppId> runtime_app_id;
         std::vector<gui::ScopedConnection> action_connections;
         std::set<std::string> action_connection_keys;
@@ -202,9 +203,24 @@ public:
     std::expected<void, std::string> ensure_gui_loaded(AppRecord &record);
     std::expected<void, std::string> prepare_installed_app_gui(AppRecord &record);
     void release_app_gui_presentation(AppRecord &record);
-    void cleanup_stopped_app_gui(AppRecord &record);
-    void rollback_installed_app_gui(AppRecord &record);
-    void unload_gui(AppRecord &record);
+    std::expected<void, std::string> cleanup_stopped_app_gui(AppRecord &record);
+    std::expected<void, std::string> rollback_installed_app_gui(AppRecord &record);
+    std::expected<void, std::string> unload_gui(AppRecord &record);
+    std::expected<gui::DocumentId, std::string> load_auxiliary_gui_file(
+        AppRecord &record,
+        std::string path
+    );
+    std::expected<gui::DocumentId, std::string> load_auxiliary_gui_json(
+        AppRecord &record,
+        std::string root_path,
+        std::string json,
+        std::string resource_dir
+    );
+    bool unload_auxiliary_gui_document(
+        AppRecord &record,
+        gui::DocumentId document_id
+    );
+    std::expected<void, std::string> unload_auxiliary_gui_documents(AppRecord &record);
     std::expected<void, std::string> enable_live_preview_for_document(
         gui::DocumentId document_id,
         const gui::LivePreviewOptions &options

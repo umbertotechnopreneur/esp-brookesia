@@ -8,7 +8,9 @@
 #   define BROOKESIA_LOG_DISABLE_DEBUG_TRACE 1
 #endif
 #include <algorithm>
+#include <filesystem>
 #include <set>
+#include <vector>
 
 #include "boost/json.hpp"
 
@@ -22,6 +24,60 @@ namespace esp_brookesia::system::core {
 namespace {
 
 constexpr uint32_t STORAGE_FS_TIMEOUT_MS = 5000;
+
+std::string join_gui_resource_path(
+    std::string_view resource_dir,
+    std::string_view path
+)
+{
+    if (path.empty()) {
+        return {};
+    }
+    std::filesystem::path source(path);
+    if (source.is_absolute() || resource_dir.empty()) {
+        return source.string();
+    }
+    return (std::filesystem::path(resource_dir) / source).string();
+}
+
+std::expected<std::string, std::string> normalize_relative_gui_document_path(
+    std::string_view path
+)
+{
+    if (path.empty()) {
+        return std::unexpected("GUI document path must not be empty");
+    }
+    if (path.find('\0') != std::string_view::npos) {
+        return std::unexpected("GUI document path contains an embedded null");
+    }
+
+    std::string portable_path(path);
+    std::replace(portable_path.begin(), portable_path.end(), '\\', '/');
+    if (portable_path.front() == '/' ||
+        portable_path.find(':') != std::string::npos) {
+        return std::unexpected("GUI document path must be relative");
+    }
+
+    const std::filesystem::path source(portable_path);
+    if (source.is_absolute() ||
+        source.has_root_name() ||
+        source.has_root_directory()) {
+        return std::unexpected("GUI document path must be relative");
+    }
+    for (const auto &component : source) {
+        if (component.generic_string() == "..") {
+            return std::unexpected(
+                "GUI document path must not traverse its resource directory"
+            );
+        }
+    }
+
+    const std::filesystem::path normalized = source.lexically_normal();
+    if (normalized.empty() || normalized == ".") {
+        return std::unexpected("GUI document path must name a file");
+    }
+    return normalized.generic_string();
+}
 
 std::string make_binding_update_key(std::string_view absolute_path, std::string_view key)
 {
@@ -526,10 +582,19 @@ std::expected<void, std::string> System::Impl::ensure_gui_loaded(AppRecord &reco
             auto preview_result = enable_live_preview_for_document(
                                       *record.document_id,
                                       config_.gui_live_preview_options
-                                  );
+            );
             if (!preview_result) {
                 if (!gui_runtime_->unload(*record.document_id)) {
-                    BROOKESIA_LOGW("Failed to rollback app GUI document load: document_id(%1%)", record.document_id->value());
+                    BROOKESIA_LOGW(
+                        "Failed to rollback app GUI document load: "
+                        "app_id(%1%), document_id(%2%)",
+                        record.info.app_id,
+                        record.document_id->value()
+                    );
+                    return std::unexpected(
+                               preview_result.error() +
+                               "; failed to unload the app GUI document"
+                           );
                 }
                 record.document_id.reset();
                 return std::unexpected(preview_result.error());
@@ -619,38 +684,250 @@ void System::Impl::release_app_gui_presentation(AppRecord &record)
 }
 
 
-void System::Impl::cleanup_stopped_app_gui(AppRecord &record)
+std::expected<void, std::string> System::Impl::cleanup_stopped_app_gui(AppRecord &record)
 {
     clear_pending_gui_bindings(record.info.app_id);
     if (record.preload_dom) {
+        auto unload_result = unload_auxiliary_gui_documents(record);
         release_app_gui_presentation(record);
-        return;
+        return unload_result;
     }
 
-    unload_gui(record);
+    auto unload_result = unload_gui(record);
+    if (!unload_result) {
+        return unload_result;
+    }
     unregister_app_gui_resources(record);
+    return {};
 }
 
 
-void System::Impl::rollback_installed_app_gui(AppRecord &record)
+std::expected<void, std::string> System::Impl::rollback_installed_app_gui(AppRecord &record)
 {
-    unload_gui(record);
+    auto unload_result = unload_gui(record);
+    if (!unload_result) {
+        return unload_result;
+    }
     unregister_app_gui_resources(record);
     unregister_app_icon_resource(record);
+    return {};
 }
 
 
-void System::Impl::unload_gui(AppRecord &record)
+std::expected<void, std::string> System::Impl::unload_gui(AppRecord &record)
 {
     record.action_connections.clear();
     record.action_connection_keys.clear();
-    if (gui_runtime_ && record.document_id.has_value()) {
-        remove_live_preview_document(*record.document_id);
-        if (!gui_runtime_->unload(*record.document_id)) {
-            BROOKESIA_LOGW("Failed to unload app GUI document: document_id(%1%)", record.document_id->value());
+    auto auxiliary_result = unload_auxiliary_gui_documents(record);
+
+    std::optional<std::string> primary_error;
+    if (record.document_id.has_value()) {
+        if (!gui_runtime_) {
+            primary_error = "GUI runtime is unavailable while unloading app GUI document";
+            BROOKESIA_LOGW(
+                "Failed to unload app GUI document: app_id(%1%), "
+                "document_id(%2%), GUI runtime is unavailable",
+                record.info.app_id,
+                record.document_id->value()
+            );
+        } else if (!gui_runtime_->unload(*record.document_id)) {
+            primary_error =
+                "Failed to unload app GUI document " +
+                std::to_string(record.document_id->value());
+            BROOKESIA_LOGW(
+                "Failed to unload app GUI document: app_id(%1%), document_id(%2%)",
+                record.info.app_id,
+                record.document_id->value()
+            );
+        } else {
+            remove_live_preview_document(*record.document_id);
+            record.document_id.reset();
         }
     }
-    record.document_id.reset();
+
+    if (!auxiliary_result && primary_error.has_value()) {
+        return std::unexpected(
+                   auxiliary_result.error() + "; " + *primary_error
+               );
+    }
+    if (!auxiliary_result) {
+        return auxiliary_result;
+    }
+    if (primary_error.has_value()) {
+        return std::unexpected(std::move(*primary_error));
+    }
+    return {};
+}
+
+std::expected<gui::DocumentId, std::string>
+System::Impl::load_auxiliary_gui_file(
+    AppRecord &record,
+    std::string path
+)
+{
+    if (!gui_runtime_) {
+        return std::unexpected("GUI runtime is not available");
+    }
+    if (!record.auxiliary_document_ids.empty()) {
+        return std::unexpected(
+                   "App already owns an auxiliary GUI document; unload it "
+                   "before loading another"
+               );
+    }
+
+    auto load_result = gui_runtime_->load_file(path, environment_);
+    if (!load_result) {
+        return load_result;
+    }
+    const gui::DocumentId document_id = *load_result;
+    const bool inserted =
+        record.auxiliary_document_ids.insert(document_id.value()).second;
+    if (!inserted) {
+        return std::unexpected("GUI runtime returned a duplicate document id");
+    }
+
+    if (config_.enable_gui_live_preview) {
+        auto preview_result = enable_live_preview_for_document(
+                                  document_id,
+                                  config_.gui_live_preview_options
+                              );
+        if (!preview_result) {
+            if (gui_runtime_->unload(document_id)) {
+                record.auxiliary_document_ids.erase(document_id.value());
+            } else {
+                BROOKESIA_LOGW(
+                    "Failed to rollback auxiliary GUI document load: "
+                    "app_id(%1%), document_id(%2%)",
+                    record.info.app_id,
+                    document_id.value()
+                );
+            }
+            return std::unexpected(preview_result.error());
+        }
+    }
+    return document_id;
+}
+
+std::expected<gui::DocumentId, std::string>
+System::Impl::load_auxiliary_gui_json(
+    AppRecord &record,
+    std::string root_path,
+    std::string json,
+    std::string resource_dir
+)
+{
+    if (!gui_runtime_) {
+        return std::unexpected("GUI runtime is not available");
+    }
+    if (!record.auxiliary_document_ids.empty()) {
+        return std::unexpected(
+                   "App already owns an auxiliary GUI document; unload it "
+                   "before loading another"
+               );
+    }
+
+    auto load_result = gui_runtime_->load_json(
+                           root_path,
+                           json,
+                           resource_dir,
+                           environment_
+                       );
+    if (!load_result) {
+        return load_result;
+    }
+    const gui::DocumentId document_id = *load_result;
+    const bool inserted =
+        record.auxiliary_document_ids.insert(document_id.value()).second;
+    if (!inserted) {
+        return std::unexpected("GUI runtime returned a duplicate document id");
+    }
+    return document_id;
+}
+
+bool System::Impl::unload_auxiliary_gui_document(
+    AppRecord &record,
+    gui::DocumentId document_id
+)
+{
+    const auto owned_document =
+        record.auxiliary_document_ids.find(document_id.value());
+    if (owned_document == record.auxiliary_document_ids.end()) {
+        // Cleanup may already have removed this app-owned document after a
+        // failed lifecycle callback. Treat a retry as complete without ever
+        // forwarding an unowned id to the GUI runtime.
+        return true;
+    }
+    if (!gui_runtime_) {
+        BROOKESIA_LOGW(
+            "Failed to unload auxiliary GUI document: app_id(%1%), "
+            "document_id(%2%), GUI runtime is unavailable",
+            record.info.app_id,
+            document_id.value()
+        );
+        return false;
+    }
+
+    if (!gui_runtime_->unload(document_id)) {
+        BROOKESIA_LOGW(
+            "Failed to unload auxiliary GUI document: app_id(%1%), "
+            "document_id(%2%)",
+            record.info.app_id,
+            document_id.value()
+        );
+        return false;
+    }
+    remove_live_preview_document(document_id);
+    record.auxiliary_document_ids.erase(owned_document);
+    return true;
+}
+
+std::expected<void, std::string>
+System::Impl::unload_auxiliary_gui_documents(AppRecord &record)
+{
+    if (record.auxiliary_document_ids.empty()) {
+        return {};
+    }
+    if (!gui_runtime_) {
+        BROOKESIA_LOGW(
+            "Failed to cleanup auxiliary GUI documents: app_id(%1%), "
+            "GUI runtime is unavailable",
+            record.info.app_id
+        );
+        return std::unexpected(
+                   "GUI runtime is unavailable while unloading auxiliary GUI documents"
+               );
+    }
+
+    std::vector<gui::DocumentId::Value> failed_documents;
+    auto document = record.auxiliary_document_ids.begin();
+    while (document != record.auxiliary_document_ids.end()) {
+        const gui::DocumentId document_id(*document);
+        if (!gui_runtime_->unload(document_id)) {
+            BROOKESIA_LOGW(
+                "Failed to cleanup auxiliary GUI document: app_id(%1%), "
+                "document_id(%2%)",
+                record.info.app_id,
+                document_id.value()
+            );
+            failed_documents.push_back(document_id.value());
+            ++document;
+            continue;
+        }
+        remove_live_preview_document(document_id);
+        document = record.auxiliary_document_ids.erase(document);
+    }
+    if (!failed_documents.empty()) {
+        std::string error = "Failed to unload auxiliary GUI document";
+        if (failed_documents.size() > 1) {
+            error += "s";
+        }
+        error += ":";
+        for (const auto document_id : failed_documents) {
+            error += " " + std::to_string(document_id);
+        }
+        return std::unexpected(std::move(error));
+    }
+    return {};
 }
 
 
@@ -1548,6 +1825,76 @@ std::expected<gui::DocumentId, std::string> System::system_gui_load_file(
     return system_gui().load_file(resource_dir, path);
 }
 
+std::expected<gui::DocumentId, std::string> System::system_gui_load_file(
+    AppId app_id,
+    std::string_view path
+)
+{
+    auto normalized_path = normalize_relative_gui_document_path(path);
+    if (!normalized_path) {
+        return std::unexpected(normalized_path.error());
+    }
+
+    return impl_->run_task_sync<std::expected<gui::DocumentId, std::string>>(
+               SYSTEM_GUI_TASK_GROUP,
+               [this,
+                app_id,
+                path = std::move(*normalized_path)]()
+    -> std::expected<gui::DocumentId, std::string> {
+        auto record_result = impl_->get_record(app_id);
+        if (!record_result) {
+            return std::unexpected(record_result.error());
+        }
+        auto &record = *record_result.value();
+        if (record.info.manifest.kind != AppKind::Native) {
+            return std::unexpected(
+                "Only native system apps can load auxiliary GUI documents"
+            );
+        }
+        return impl_->load_auxiliary_gui_file(
+                   record,
+                   impl_->resolve_app_resource_path(
+                       record.info.manifest,
+                       path
+                   )
+               );
+    },
+    std::unexpected("Failed to post app GUI document load task")
+           );
+}
+
+std::expected<gui::DocumentId, std::string> System::system_gui_load_file(
+    AppId app_id,
+    std::string_view resource_dir,
+    std::string_view path
+)
+{
+    return impl_->run_task_sync<std::expected<gui::DocumentId, std::string>>(
+               SYSTEM_GUI_TASK_GROUP,
+               [this,
+                app_id,
+                source_path = join_gui_resource_path(resource_dir, path)]()
+    mutable
+    -> std::expected<gui::DocumentId, std::string> {
+        auto record_result = impl_->get_record(app_id);
+        if (!record_result) {
+            return std::unexpected(record_result.error());
+        }
+        auto &record = *record_result.value();
+        if (record.info.manifest.kind != AppKind::Native) {
+            return std::unexpected(
+                "Only native system apps can load auxiliary GUI documents"
+            );
+        }
+        return impl_->load_auxiliary_gui_file(
+                   record,
+                   std::move(source_path)
+               );
+    },
+    std::unexpected("Failed to post app GUI document load task")
+           );
+}
+
 std::expected<gui::DocumentId, std::string> System::system_gui_load_json(
     std::string_view root_path,
     std::string_view json,
@@ -1555,6 +1902,42 @@ std::expected<gui::DocumentId, std::string> System::system_gui_load_json(
 )
 {
     return system_gui().load_json(root_path, json, resource_dir);
+}
+
+std::expected<gui::DocumentId, std::string> System::system_gui_load_json(
+    AppId app_id,
+    std::string_view root_path,
+    std::string_view json,
+    std::string_view resource_dir
+)
+{
+    return impl_->run_task_sync<std::expected<gui::DocumentId, std::string>>(
+               SYSTEM_GUI_TASK_GROUP,
+               [this,
+                app_id,
+                root_path = std::string(root_path),
+                json = std::string(json),
+                resource_dir = std::string(resource_dir)]()
+    mutable -> std::expected<gui::DocumentId, std::string> {
+        auto record_result = impl_->get_record(app_id);
+        if (!record_result) {
+            return std::unexpected(record_result.error());
+        }
+        auto &record = *record_result.value();
+        if (record.info.manifest.kind != AppKind::Native) {
+            return std::unexpected(
+                "Only native system apps can load auxiliary GUI documents"
+            );
+        }
+        return impl_->load_auxiliary_gui_json(
+                   record,
+                   std::move(root_path),
+                   std::move(json),
+                   std::move(resource_dir)
+               );
+    },
+    std::unexpected("Failed to post app GUI JSON document load task")
+           );
 }
 
 std::expected<gui::View, std::string> System::system_gui_mount_screen(
@@ -1574,6 +1957,34 @@ bool System::system_gui_unmount_screen(gui::DocumentId document_id, std::string_
 bool System::system_gui_unload(gui::DocumentId document_id)
 {
     return system_gui().unload(document_id);
+}
+
+bool System::system_gui_unload(
+    AppId app_id,
+    gui::DocumentId document_id
+)
+{
+    return impl_->run_task_sync<bool>(
+               SYSTEM_GUI_TASK_GROUP,
+               [this, app_id, document_id]() {
+        auto record_result = impl_->get_record(app_id);
+        if (!record_result) {
+            BROOKESIA_LOGW(
+                "Rejected auxiliary GUI document unload: app_id(%1%), "
+                "document_id(%2%), error(%3%)",
+                app_id,
+                document_id.value(),
+                record_result.error()
+            );
+            return false;
+        }
+        return impl_->unload_auxiliary_gui_document(
+                   *record_result.value(),
+                   document_id
+               );
+    },
+    false
+           );
 }
 
 std::expected<void, std::string> System::system_gui_enable_live_preview(

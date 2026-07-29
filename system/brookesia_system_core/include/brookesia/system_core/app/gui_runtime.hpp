@@ -127,6 +127,11 @@ public:
     ) const;
     std::string get_language() const;
 
+    // App-scoped auxiliary GUI documents are intentionally single-resident:
+    // unload the current document before loading another one.
+    std::expected<gui::DocumentId, std::string> load_file(
+        std::string_view path
+    ) const;
     std::expected<gui::DocumentId, std::string> load_file(
         std::string_view resource_dir,
         std::string_view path
@@ -148,6 +153,13 @@ public:
         gui::DocumentId document_id,
         std::string_view absolute_path,
         std::string_view text
+    ) const;
+    std::expected<void, std::string> scroll_to(
+        gui::DocumentId document_id,
+        std::string_view absolute_path,
+        int32_t x,
+        int32_t y,
+        bool animated = true
     ) const;
     std::expected<gui::View, std::string> mount_screen(
         gui::DocumentId document_id,

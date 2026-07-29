@@ -641,6 +641,19 @@ std::string AppGuiRuntime::get_language() const
 }
 
 std::expected<gui::DocumentId, std::string> AppGuiRuntime::load_file(
+    std::string_view path
+) const
+{
+    if (system_ == nullptr) {
+        return std::unexpected("System is not available");
+    }
+    if (!is_native_system_app()) {
+        return std::unexpected("Only native system apps can load system GUI documents");
+    }
+    return system_->system_gui_load_file(app_id_, path);
+}
+
+std::expected<gui::DocumentId, std::string> AppGuiRuntime::load_file(
     std::string_view resource_dir,
     std::string_view path
 ) const
@@ -651,7 +664,7 @@ std::expected<gui::DocumentId, std::string> AppGuiRuntime::load_file(
     if (!is_native_system_app()) {
         return std::unexpected("Only native system apps can load system GUI documents");
     }
-    return system_->system_gui_load_file(resource_dir, path);
+    return system_->system_gui_load_file(app_id_, resource_dir, path);
 }
 
 std::expected<gui::DocumentId, std::string> AppGuiRuntime::load_json(
@@ -666,7 +679,12 @@ std::expected<gui::DocumentId, std::string> AppGuiRuntime::load_json(
     if (!is_native_system_app()) {
         return std::unexpected("Only native system apps can load system GUI documents");
     }
-    return system_->system_gui_load_json(root_path, json, resource_dir);
+    return system_->system_gui_load_json(
+               app_id_,
+               root_path,
+               json,
+               resource_dir
+           );
 }
 
 std::expected<void, std::string> AppGuiRuntime::set_binding_values(
@@ -710,6 +728,29 @@ std::expected<void, std::string> AppGuiRuntime::set_text(
         return std::unexpected("Only native system apps can update system GUI documents");
     }
     return system_->system_gui().set_text(document_id, absolute_path, text);
+}
+
+std::expected<void, std::string> AppGuiRuntime::scroll_to(
+    gui::DocumentId document_id,
+    std::string_view absolute_path,
+    int32_t x,
+    int32_t y,
+    bool animated
+) const
+{
+    if (system_ == nullptr) {
+        return std::unexpected("System is not available");
+    }
+    if (!is_native_system_app()) {
+        return std::unexpected("Only native system apps can scroll system GUI documents");
+    }
+    return system_->system_gui().scroll_to(
+               document_id,
+               absolute_path,
+               x,
+               y,
+               animated
+           );
 }
 
 std::expected<gui::View, std::string> AppGuiRuntime::mount_screen(
@@ -781,7 +822,8 @@ std::optional<std::string> AppGuiRuntime::get_screen_flow_state(
 
 bool AppGuiRuntime::unload(gui::DocumentId document_id) const
 {
-    return (system_ != nullptr) && is_native_system_app() && system_->system_gui_unload(document_id);
+    return (system_ != nullptr) && is_native_system_app() &&
+           system_->system_gui_unload(app_id_, document_id);
 }
 
 gui::ScopedConnection AppGuiRuntime::subscribe_action(

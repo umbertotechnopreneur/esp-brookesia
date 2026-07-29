@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "brookesia/system_core/macro_configs.h"
@@ -44,6 +45,19 @@ bool is_runtime_service_call_context()
 int64_t elapsed_ms_since(SteadyTimePoint started_at, SteadyTimePoint ended_at = SteadyClock::now())
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(ended_at - started_at).count();
+}
+
+std::string with_cleanup_failure(
+    std::string operation_error,
+    std::string_view cleanup_operation,
+    std::string_view cleanup_error
+)
+{
+    operation_error += "; ";
+    operation_error += cleanup_operation;
+    operation_error += " failed: ";
+    operation_error += cleanup_error;
+    return operation_error;
 }
 
 } // namespace
@@ -291,13 +305,20 @@ std::expected<AppId, std::string> System::install_app(std::shared_ptr<IApp> app)
         auto rollback_result = impl_->run_task_sync<std::expected<void, std::string>>(
                                    SYSTEM_GUI_TASK_GROUP,
         [this, &it]() -> std::expected<void, std::string> {
-            impl_->rollback_installed_app_gui(it->second);
-            return {};
+            return impl_->rollback_installed_app_gui(it->second);
         },
         std::unexpected("Failed to post app GUI install rollback task")
                                );
         if (!rollback_result) {
             BROOKESIA_LOGW("Failed to rollback app GUI resources: %1%", rollback_result.error());
+            auto error = with_cleanup_failure(
+                             gui_prepare_result.error(),
+                             "GUI install rollback",
+                             rollback_result.error()
+                         );
+            it->second.info.state = AppState::Error;
+            it->second.info.last_error = error;
+            return std::unexpected(std::move(error));
         }
         impl_->manifest_id_to_app_.erase(it->second.info.manifest.id);
         impl_->apps_.erase(it);
@@ -308,13 +329,20 @@ std::expected<AppId, std::string> System::install_app(std::shared_ptr<IApp> app)
         auto rollback_result = impl_->run_task_sync<std::expected<void, std::string>>(
                                    SYSTEM_GUI_TASK_GROUP,
         [this, &it]() -> std::expected<void, std::string> {
-            impl_->rollback_installed_app_gui(it->second);
-            return {};
+            return impl_->rollback_installed_app_gui(it->second);
         },
         std::unexpected("Failed to post app GUI install rollback task")
                                );
         if (!rollback_result) {
             BROOKESIA_LOGW("Failed to rollback app GUI resources: %1%", rollback_result.error());
+            auto error = with_cleanup_failure(
+                             hook_result.error(),
+                             "GUI install rollback",
+                             rollback_result.error()
+                         );
+            it->second.info.state = AppState::Error;
+            it->second.info.last_error = error;
+            return std::unexpected(std::move(error));
         }
         impl_->manifest_id_to_app_.erase(it->second.info.manifest.id);
         impl_->apps_.erase(it);
@@ -384,13 +412,20 @@ std::expected<AppId, std::string> System::install_runtime_app(const AppManifest 
         auto rollback_result = impl_->run_task_sync<std::expected<void, std::string>>(
                                    SYSTEM_GUI_TASK_GROUP,
         [this, &it]() -> std::expected<void, std::string> {
-            impl_->rollback_installed_app_gui(it->second);
-            return {};
+            return impl_->rollback_installed_app_gui(it->second);
         },
         std::unexpected("Failed to post app GUI install rollback task")
                                );
         if (!rollback_result) {
             BROOKESIA_LOGW("Failed to rollback app GUI resources: %1%", rollback_result.error());
+            auto error = with_cleanup_failure(
+                             gui_prepare_result.error(),
+                             "GUI install rollback",
+                             rollback_result.error()
+                         );
+            it->second.info.state = AppState::Error;
+            it->second.info.last_error = error;
+            return std::unexpected(std::move(error));
         }
         impl_->manifest_id_to_app_.erase(it->second.info.manifest.id);
         impl_->apps_.erase(it);
@@ -401,13 +436,20 @@ std::expected<AppId, std::string> System::install_runtime_app(const AppManifest 
         auto rollback_result = impl_->run_task_sync<std::expected<void, std::string>>(
                                    SYSTEM_GUI_TASK_GROUP,
         [this, &it]() -> std::expected<void, std::string> {
-            impl_->rollback_installed_app_gui(it->second);
-            return {};
+            return impl_->rollback_installed_app_gui(it->second);
         },
         std::unexpected("Failed to post app GUI install rollback task")
                                );
         if (!rollback_result) {
             BROOKESIA_LOGW("Failed to rollback app GUI resources: %1%", rollback_result.error());
+            auto error = with_cleanup_failure(
+                             hook_result.error(),
+                             "GUI install rollback",
+                             rollback_result.error()
+                         );
+            it->second.info.state = AppState::Error;
+            it->second.info.last_error = error;
+            return std::unexpected(std::move(error));
         }
         impl_->manifest_id_to_app_.erase(it->second.info.manifest.id);
         impl_->apps_.erase(it);
@@ -490,13 +532,15 @@ std::expected<void, std::string> System::uninstall_app(AppId app_id)
                               SYSTEM_GUI_TASK_GROUP,
     [this, &record]() -> std::expected<void, std::string> {
         impl_->clear_pending_gui_bindings(record.info.app_id);
-        impl_->rollback_installed_app_gui(record);
-        return {};
+        return impl_->rollback_installed_app_gui(record);
     },
     std::unexpected("Failed to post GUI cleanup task")
                           );
     if (!cleanup_result) {
         BROOKESIA_LOGW("Failed to cleanup app GUI while uninstalling app: %1%", cleanup_result.error());
+        record.info.state = AppState::Error;
+        record.info.last_error = cleanup_result.error();
+        return std::unexpected(cleanup_result.error());
     }
     if (record.info.manifest.kind == AppKind::Runtime) {
         if (record.info.manifest.app_path.empty()) {
@@ -649,13 +693,31 @@ std::expected<void, std::string> System::start_app(AppId app_id, const AppStartO
                 auto target = map_manifest_target(record.info.manifest.kind, flow_entry);
                 if (!target) {
                     log_gui_profile("screen_flow_mount_failed", screen_flow_started_at);
-                    impl_->unload_gui(record);
+                    auto unload_result = impl_->unload_gui(record);
+                    if (!unload_result) {
+                        return std::unexpected(
+                                   with_cleanup_failure(
+                                       target.error(),
+                                       "GUI rollback",
+                                       unload_result.error()
+                                   )
+                               );
+                    }
                     impl_->unregister_app_gui_resources(record);
                     return std::unexpected(target.error());
                 }
                 if (!impl_->gui_runtime_->has_screen_flow(*record.document_id, flow_entry.screen_flow)) {
                     log_gui_profile("screen_flow_mount_failed", screen_flow_started_at);
-                    impl_->unload_gui(record);
+                    auto unload_result = impl_->unload_gui(record);
+                    if (!unload_result) {
+                        return std::unexpected(
+                                   with_cleanup_failure(
+                                       "App GUI screen flow is not found: " + flow_entry.screen_flow,
+                                       "GUI rollback",
+                                       unload_result.error()
+                                   )
+                               );
+                    }
                     impl_->unregister_app_gui_resources(record);
                     return std::unexpected("App GUI screen flow is not found: " + flow_entry.screen_flow);
                 }
@@ -666,7 +728,16 @@ std::expected<void, std::string> System::start_app(AppId app_id, const AppStartO
                                    );
                 if (!flow_result) {
                     log_gui_profile("screen_flow_mount_failed", screen_flow_started_at);
-                    impl_->unload_gui(record);
+                    auto unload_result = impl_->unload_gui(record);
+                    if (!unload_result) {
+                        return std::unexpected(
+                                   with_cleanup_failure(
+                                       flow_result.error(),
+                                       "GUI rollback",
+                                       unload_result.error()
+                                   )
+                               );
+                    }
                     impl_->unregister_app_gui_resources(record);
                     return flow_result;
                 }
@@ -764,7 +835,10 @@ std::expected<void, std::string> System::start_app(AppId app_id, const AppStartO
                                    SYSTEM_GUI_TASK_GROUP,
         [this, &record]() -> std::expected<void, std::string> {
             impl_->clear_pending_gui_bindings(record.info.app_id);
-            impl_->unload_gui(record);
+            auto unload_result = impl_->unload_gui(record);
+            if (!unload_result) {
+                return unload_result;
+            }
             impl_->unregister_app_gui_resources(record);
             return {};
         },
@@ -772,6 +846,13 @@ std::expected<void, std::string> System::start_app(AppId app_id, const AppStartO
                                );
         if (!rollback_result) {
             BROOKESIA_LOGW("Failed to rollback app GUI after start failure: %1%", rollback_result.error());
+            start_result = std::unexpected(
+                               with_cleanup_failure(
+                                   start_result.error(),
+                                   "GUI rollback",
+                                   rollback_result.error()
+                               )
+                           );
         }
         record.info.state = AppState::Error;
         record.info.last_error = start_result.error();
@@ -933,7 +1014,7 @@ std::expected<void, std::string> System::stop_app(AppId app_id)
     [this, &record]() -> std::expected<void, std::string> {
         auto heap_before_gui_cleanup = heap_trace::capture();
         heap_trace::log("system.gui", "before cleanup", record.info.manifest.id, heap_before_gui_cleanup);
-        impl_->cleanup_stopped_app_gui(record);
+        auto result = impl_->cleanup_stopped_app_gui(record);
         heap_trace::log(
             "system.gui",
             "after cleanup",
@@ -941,12 +1022,23 @@ std::expected<void, std::string> System::stop_app(AppId app_id)
             heap_trace::capture(),
             &heap_before_gui_cleanup
         );
-        return {};
+        return result;
     },
     std::unexpected("Failed to post app GUI cleanup task")
                           );
     if (!cleanup_result) {
         BROOKESIA_LOGW("Failed to cleanup app GUI while stopping app: %1%", cleanup_result.error());
+        if (!stop_result) {
+            stop_result = std::unexpected(
+                              with_cleanup_failure(
+                                  stop_result.error(),
+                                  "GUI cleanup",
+                                  cleanup_result.error()
+                              )
+                          );
+        } else {
+            stop_result = std::unexpected(cleanup_result.error());
+        }
     }
     if (!stop_result) {
         record.info.state = AppState::Error;
