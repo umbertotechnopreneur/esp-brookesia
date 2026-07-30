@@ -5878,7 +5878,7 @@ private:
             }
             break;
         case BindingApplyDomain::Style:
-            record.resolved_style = resolve_style_shared(tree, record.node);
+            record.resolved_style = resolve_style_uncached(tree, record.node);
             backend->apply_style(record.handle, *record.resolved_style, target_info.style_mask);
             backend->apply_debug_visual(record.handle, view_debug_enabled_);
             break;
@@ -5915,7 +5915,7 @@ private:
             }
         }
         if (masks.style != StyleApplyMask::None) {
-            record.resolved_style = resolve_style_shared(tree, record.node);
+            record.resolved_style = resolve_style_uncached(tree, record.node);
             backend->apply_style(record.handle, *record.resolved_style, masks.style);
             backend->apply_debug_visual(record.handle, view_debug_enabled_);
         }
@@ -7058,6 +7058,12 @@ private:
 
         resolve_font_chain("default", true);
         return resolved_style;
+    }
+
+    std::shared_ptr<const ResolvedStyle> resolve_style_uncached(const TreeRecord &tree, const Node &node)
+    {
+        // Runtime-bound variants belong to the node, not the persistent dedup cache.
+        return std::make_shared<const ResolvedStyle>(resolve_style(tree, node));
     }
 
     // Returns a shared, immutable ResolvedStyle for `node`, reusing a cached instance when another node

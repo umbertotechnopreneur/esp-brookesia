@@ -576,7 +576,7 @@ static std::expected<std::string, std::string> read_text_file(const std::filesys
         result->size(),
         parser_profile_elapsed_ms(start, end)
     );
-    return result.value();
+    return std::move(result).value();
 }
 
 static std::expected<FileTextMap, std::string> read_text_files(

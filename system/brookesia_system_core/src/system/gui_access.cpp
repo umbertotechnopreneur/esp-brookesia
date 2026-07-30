@@ -334,7 +334,8 @@ std::expected<void, std::string> SystemGuiAccess::set_binding_values(
     }
     return system_->impl_->run_task_sync<std::expected<void, std::string>>(
                SYSTEM_GUI_INPUT_TASK_GROUP,
-    [this, document_id, updates]() -> std::expected<void, std::string> {
+    // run_task_sync does not return until the GUI task has consumed this batch.
+    [this, document_id, &updates]() -> std::expected<void, std::string> {
         if (!system_->impl_->gui_runtime_)
         {
             return std::unexpected("GUI runtime is not available");
