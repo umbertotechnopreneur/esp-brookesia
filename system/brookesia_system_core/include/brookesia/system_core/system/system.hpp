@@ -170,6 +170,11 @@ public:
     std::expected<void, std::string> stop_app(AppId app_id);
     std::expected<void, std::string> pause_app(AppId app_id);
     std::expected<void, std::string> resume_app(AppId app_id);
+    std::expected<void, std::string> app_quiesce_input(
+        AppId app_id,
+        AppInputQuiescedHandler on_drained
+    );
+    std::expected<void, std::string> app_resume_input(AppId app_id);
     std::expected<void, std::string> request_close_app(AppId app_id);
     std::expected<void, std::string> show_app_loading(AppId app_id);
     std::expected<void, std::string> hide_app_loading(AppId app_id);
@@ -340,7 +345,10 @@ public:
         const gui::Animation &animation,
         gui::Runtime::AnimationCompletedHandler completed_handler = {}
     );
-    bool gui_stop_animation(AppId app_id, gui::SubscriptionId subscription_id);
+    std::expected<void, std::string> gui_stop_animation(
+        AppId app_id,
+        gui::SubscriptionId subscription_id
+    );
     std::expected<void, std::string> gui_scroll_to(
         AppId app_id,
         std::string_view absolute_path,
@@ -357,6 +365,7 @@ public:
         AppId app_id,
         const std::vector<GuiBatchCommand> &commands
     );
+    std::expected<void, std::string> gui_drain_pending_work(AppId app_id);
 
     std::expected<TimerId, std::string> timer_start_periodic(
         AppId app_id,
@@ -487,8 +496,16 @@ private:
         MessageDialogOptions options,
         bool validate_owner
     );
-    void close_message_dialogs_for_app(AppId app_id);
-    void publish_message_dialog_closed(MessageDialogResult result, MessageDialogResultHandler handler);
+    std::expected<void, std::string> close_app_input_requests(AppId app_id);
+    std::expected<void, std::string> close_message_dialogs_for_app(AppId app_id);
+    std::expected<void, std::string> publish_keyboard_closed(
+        KeyboardResult result,
+        KeyboardResultHandler handler
+    );
+    std::expected<void, std::string> publish_message_dialog_closed(
+        MessageDialogResult result,
+        MessageDialogResultHandler handler
+    );
     void remove_queued_message_dialog(MessageDialogRequestId request_id);
     SystemGuiAccess system_gui_access_;
     std::unique_ptr<Impl> impl_;

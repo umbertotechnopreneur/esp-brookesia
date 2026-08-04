@@ -39,6 +39,11 @@ public:
     ) const;
     std::expected<void, std::string> set_binding_values(const std::vector<gui::BindingValueUpdate> &updates) const;
     std::expected<GuiBatchResult, std::string> execute_batch(const std::vector<GuiBatchCommand> &commands) const;
+    std::expected<void, std::string> drain_pending_work() const;
+    std::expected<void, std::string> quiesce_input(
+        AppInputQuiescedHandler on_drained
+    ) const;
+    std::expected<void, std::string> resume_input() const;
     std::optional<std::string> get_binding_value(std::string_view absolute_path, std::string_view key) const;
     std::expected<boost::json::value, std::string> get_constant_value(std::string_view path) const;
     std::expected<void, std::string> set_text(std::string_view absolute_path, std::string_view text) const;
@@ -93,7 +98,9 @@ public:
         const gui::Animation &animation,
         gui::Runtime::AnimationCompletedHandler completed_handler = {}
     ) const;
-    bool stop_animation(gui::SubscriptionId subscription_id) const;
+    std::expected<void, std::string> stop_animation(
+        gui::SubscriptionId subscription_id
+    ) const;
     std::expected<void, std::string> set_view_debug_enabled(bool enabled) const;
     bool is_view_debug_enabled() const;
     std::expected<void, std::string> enable_live_preview(const gui::LivePreviewOptions &options = {}) const;

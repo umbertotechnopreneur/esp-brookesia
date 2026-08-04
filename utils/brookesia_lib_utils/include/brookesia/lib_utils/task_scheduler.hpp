@@ -31,6 +31,7 @@
 #   include "boost/asio/strand.hpp"
 #endif
 #include "boost/thread/mutex.hpp"
+#include "boost/thread/condition_variable.hpp"
 #include "boost/thread/thread.hpp"
 #include "boost/thread/future.hpp"
 #include "brookesia/lib_utils/describe_helpers.hpp"
@@ -148,7 +149,15 @@ public:
                 .stack_size = 6 * 1024,
             }
         };
-        size_t worker_poll_interval_ms = 10;             ///< Worker polling interval in milliseconds.
+        /**
+         * @brief Legacy worker polling interval retained for source/configuration compatibility.
+         *
+         * Native workers now block until posted work or the next timer deadline. This interval is
+         * used only as a compatibility fallback after `get_executor()` exposes the raw Asio
+         * executor, whose direct posts cannot signal the scheduler-owned worker condition. WASM
+         * keeps its existing browser-timer behavior.
+         */
+        size_t worker_poll_interval_ms = 10;
         /**
          * @brief Optional global pre-execute callback applied to every task.
          *
@@ -510,11 +519,21 @@ public:
      */
     std::shared_ptr<Executor> get_executor()
     {
-        boost::lock_guard lock(mutex_);
 #if BROOKESIA_LIB_UTILS_USE_WASM_SINGLE_THREAD_SCHEDULER
         return nullptr;
 #else
-        return io_context_ ? std::make_shared<Executor>(io_context_->get_executor()) : nullptr;
+        std::shared_ptr<Executor> executor;
+        {
+            boost::lock_guard lock(mutex_);
+            executor = io_context_ ? std::make_shared<Executor>(io_context_->get_executor()) : nullptr;
+        }
+        if (executor) {
+            // Raw Asio posts bypass TaskScheduler::post(), so retain bounded compatibility polling
+            // only after an executor actually escapes this API.
+            external_executor_exposed_.store(true, std::memory_order_release);
+            notify_workers();
+        }
+        return executor;
 #endif
     }
 
@@ -556,6 +575,8 @@ private:
         std::shared_ptr<boost::promise<bool>> promise; // Promise for task completion
         boost::shared_future<bool> future; // Shared future for task completion
         std::atomic<bool> is_executing{false}; // Flag to prevent parallel execution of periodic tasks
+        std::optional<std::chrono::steady_clock::time_point> worker_deadline;
+        uint64_t worker_deadline_generation{0};
 
         // For suspend/resume support
         std::chrono::steady_clock::time_point suspend_time;
@@ -609,6 +630,20 @@ private:
     // Invoke post-execute callbacks: global ("") first, then group-specific (thread-safe)
     void invoke_post_execute_callback(TaskId task_id, TaskType task_type, bool success, const Group &group);
 
+#if !BROOKESIA_LIB_UTILS_USE_WASM_SINGLE_THREAD_SCHEDULER
+    // Wake native workers after the scheduler queue or timer set changes.
+    void notify_workers();
+
+    // Block an idle native worker until new work arrives or the earliest active timer expires.
+    void wait_for_work(uint64_t observed_generation);
+
+    // Return the earliest active timer expiry used to bound the event-driven worker wait.
+    std::optional<std::chrono::steady_clock::time_point> get_next_timer_expiry() const;
+
+    // Clear a completed timer deadline without erasing a newer reschedule of the same task.
+    void clear_timer_deadline(const std::shared_ptr<TaskHandle> &handle, uint64_t expected_generation);
+#endif
+
 private:
     std::atomic<bool> is_running_{false};
 #if !BROOKESIA_LIB_UTILS_USE_WASM_SINGLE_THREAD_SCHEDULER
@@ -629,6 +664,14 @@ private:
     std::atomic<TaskId> canceled_tasks_{0};
     std::atomic<TaskId> suspended_tasks_{0};
     std::atomic<size_t> worker_wait_slot_count_{0};
+#if !BROOKESIA_LIB_UTILS_USE_WASM_SINGLE_THREAD_SCHEDULER
+    boost::mutex worker_wait_mutex_;
+    boost::condition_variable worker_wait_cv_;
+    std::atomic<uint64_t> worker_wake_generation_{0};
+    mutable boost::mutex timer_mutex_;
+    std::atomic<bool> external_executor_exposed_{false};
+    size_t worker_poll_interval_ms_{10};
+#endif
     std::map<Group, PreExecuteCallback> pre_execute_callbacks_;   ///< Per-group pre-execute callbacks; key "" = global.
     std::map<Group, PostExecuteCallback> post_execute_callbacks_; ///< Per-group post-execute callbacks; key "" = global.
 };

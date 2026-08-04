@@ -230,6 +230,99 @@ std::expected<void, std::string> System::Impl::post_task(
     return {};
 }
 
+// Queue one app-owned input callback so quiescence can order and suppress it.
+std::expected<void, std::string> System::Impl::post_app_input_task(
+    AppId app_id,
+    lib_utils::TaskScheduler::OnceTask task
+)
+{
+    return enqueue_app_input_task(app_id, std::move(task), false);
+}
+
+// Post through the AppInput queue even from the SystemApp domain; never execute inline.
+std::expected<void, std::string> System::Impl::enqueue_app_input_task(
+    AppId app_id,
+    lib_utils::TaskScheduler::OnceTask task,
+    bool bypass_quiesce
+)
+{
+    if (!task_scheduler_ || !task_scheduler_->is_running()) {
+        return std::unexpected("App input scheduler is not running");
+    }
+
+    auto queued_task = [this, app_id, task = std::move(task), bypass_quiesce]() mutable {
+        auto record_result = get_record(app_id);
+        if (!record_result) {
+            BROOKESIA_LOGW(
+                "Skip app input callback: app_id(%1%), error(%2%)",
+                app_id,
+                record_result.error()
+            );
+            return;
+        }
+        if (!bypass_quiesce && record_result.value()->input_quiesced) {
+            BROOKESIA_LOGD(
+                "Skip app input callback while quiesced: app_id(%1%)",
+                app_id
+            );
+            return;
+        }
+        if (!bypass_quiesce &&
+            record_result.value()->info.state != AppState::Running) {
+            BROOKESIA_LOGD(
+                "Skip app input callback outside Running state: app_id(%1%), state(%2%)",
+                app_id,
+                static_cast<int>(record_result.value()->info.state)
+            );
+            return;
+        }
+        task();
+    };
+
+#if defined(__EMSCRIPTEN__)
+    if (esp_brookesia::gui::wasm::is_gui_task_blocked()) {
+        const bool queued = esp_brookesia::gui::wasm::post_gui_task(
+            [this, queued_task = std::move(queued_task)]() mutable {
+                execute_task_with_group_context(
+                    SYSTEM_APP_INPUT_TASK_GROUP,
+                    std::move(queued_task)
+                );
+            }
+        );
+        if (!queued) {
+            return std::unexpected("Failed to queue wasm app input task");
+        }
+        return {};
+    }
+    if (!task_scheduler_->post_delayed(
+            std::move(queued_task),
+            0,
+            nullptr,
+            SYSTEM_APP_INPUT_TASK_GROUP
+        )) {
+        return std::unexpected("Failed to post delayed wasm app input task");
+    }
+#else
+    if (!task_scheduler_->post(
+            std::move(queued_task),
+            nullptr,
+            SYSTEM_APP_INPUT_TASK_GROUP
+        )) {
+        return std::unexpected("Failed to post app input task");
+    }
+#endif
+    return {};
+}
+
+// Queue a bypass callback behind earlier app input without inline execution.
+std::expected<void, std::string> System::Impl::post_app_input_barrier(
+    AppId app_id,
+    lib_utils::TaskScheduler::OnceTask task
+)
+{
+    return enqueue_app_input_task(app_id, std::move(task), true);
+}
+
 std::expected<void, std::string> System::Impl::post_gui_task(lib_utils::TaskScheduler::OnceTask task)
 {
     return post_task(SYSTEM_GUI_TASK_GROUP, std::move(task));

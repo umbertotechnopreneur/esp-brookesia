@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <map>
 #include <string>
@@ -28,6 +29,10 @@ using KeyboardRequestId = uint64_t;
 inline constexpr KeyboardRequestId INVALID_KEYBOARD_REQUEST_ID = 0;
 using MessageDialogRequestId = uint64_t;
 inline constexpr MessageDialogRequestId INVALID_MESSAGE_DIALOG_REQUEST_ID = 0;
+
+// Report the result of draining one app's input and GUI work.
+using AppInputQuiescedHandler =
+    std::function<void(std::expected<void, std::string>)>;
 
 struct KeyboardRequestOptions {
     std::string title;

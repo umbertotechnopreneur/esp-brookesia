@@ -114,6 +114,7 @@ public:
         std::string_view action,
         ActionHandler handler
     );
+    bool has_subscription(SubscriptionId subscription_id) const;
     bool unsubscribe_subscription(SubscriptionId subscription_id);
     ScopedConnection subscribe_event_action(
         DocumentId id,

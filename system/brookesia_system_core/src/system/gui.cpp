@@ -1150,7 +1150,7 @@ gui::Runtime::ActionHandler System::Impl::make_app_action_forwarder(AppId app_id
                 );
             }
         };
-        auto post_result = post_task(SYSTEM_APP_INPUT_TASK_GROUP, std::move(post_action));
+        auto post_result = post_app_input_task(app_id, std::move(post_action));
         if (!post_result) {
             BROOKESIA_LOGW(
                 "Post app action failed: app_id(%1%), action(%2%), error(%3%)",
@@ -1340,15 +1340,15 @@ gui::ScopedConnection System::gui_subscribe_action(
         {
             return gui::ScopedConnection {};
         }
-        auto scheduled_handler = [this, handler = std::move(handler)](const gui::Event & event)
+        auto scheduled_handler = [this, app_id, handler = std::move(handler)](const gui::Event & event)
         {
             auto event_copy = event;
-            auto post_result = impl_->post_task(
-                                   SYSTEM_APP_INPUT_TASK_GROUP,
-            [handler, event_copy = std::move(event_copy)]() mutable {
-                handler(event_copy);
-            }
-                               );
+            auto post_result = impl_->post_app_input_task(
+                app_id,
+                [handler, event_copy = std::move(event_copy)]() mutable {
+                    handler(event_copy);
+                }
+            );
             if (!post_result) {
                 BROOKESIA_LOGW("Post app action handler failed: %1%", post_result.error());
             }
@@ -1387,12 +1387,12 @@ std::vector<gui::ScopedConnection> System::gui_subscribe_actions(
                 connections.emplace_back();
                 continue;
             }
-            auto scheduled_handler = [this, handler = std::move(subscription.handler)](const gui::Event & event) {
+            auto scheduled_handler = [this, app_id, handler = std::move(subscription.handler)](const gui::Event & event) {
                 auto event_copy = event;
                 auto post_handler = [handler, event_copy = std::move(event_copy)]() mutable {
                     handler(event_copy);
                 };
-                auto post_result = impl_->post_task(SYSTEM_APP_INPUT_TASK_GROUP, std::move(post_handler));
+                auto post_result = impl_->post_app_input_task(app_id, std::move(post_handler));
                 if (!post_result) {
                     BROOKESIA_LOGW("Post app action handler failed: %1%", post_result.error());
                 }
@@ -1598,16 +1598,16 @@ std::expected<gui::RuntimeAnimationStartResult, std::string> System::gui_start_v
         {
             return std::unexpected("App GUI document is not loaded");
         }
-        auto scheduled_completed_handler = [this, completed_handler = std::move(completed_handler)]() mutable {
+        auto scheduled_completed_handler = [this, app_id, completed_handler = std::move(completed_handler)]() mutable {
             if (!completed_handler)
             {
                 return;
             }
-            auto post_result = impl_->post_task(
-                SYSTEM_APP_INPUT_TASK_GROUP,
-            [completed_handler = std::move(completed_handler)]() mutable {
-                completed_handler();
-            }
+            auto post_result = impl_->post_app_input_task(
+                app_id,
+                [completed_handler = std::move(completed_handler)]() mutable {
+                    completed_handler();
+                }
             );
             if (!post_result)
             {
@@ -1630,14 +1630,42 @@ std::expected<gui::RuntimeAnimationStartResult, std::string> System::gui_start_v
            );
 }
 
-bool System::gui_stop_animation(AppId, gui::SubscriptionId subscription_id)
+// Stop one animation synchronously so callers receive the runtime result.
+std::expected<void, std::string> System::gui_stop_animation(
+    AppId app_id,
+    gui::SubscriptionId subscription_id
+)
 {
-    auto result = impl_->post_gui_input_task([this, subscription_id]() {
-        if (impl_->gui_runtime_) {
-            (void)impl_->gui_runtime_->unsubscribe_subscription(subscription_id);
-        }
-    });
-    return result.has_value();
+    return impl_->run_task_sync<std::expected<void, std::string>>(
+        SYSTEM_GUI_INPUT_TASK_GROUP,
+        [this, app_id, subscription_id]() -> std::expected<void, std::string> {
+            auto record_result = impl_->get_record(app_id);
+            if (!record_result) {
+                return std::unexpected(record_result.error());
+            }
+            if (!impl_->gui_runtime_) {
+                return std::unexpected("GUI runtime is not available");
+            }
+            if (!impl_->gui_runtime_->has_subscription(subscription_id)) {
+                BROOKESIA_LOGD(
+                    "GUI animation already completed: app_id(%1%), subscription_id(%2%)",
+                    app_id,
+                    subscription_id
+                );
+                return {};
+            }
+            if (!impl_->gui_runtime_->unsubscribe_subscription(subscription_id)) {
+                BROOKESIA_LOGW(
+                    "Failed to stop GUI animation: app_id(%1%), subscription_id(%2%)",
+                    app_id,
+                    subscription_id
+                );
+                return std::unexpected("Failed to stop GUI animation subscription");
+            }
+            return {};
+        },
+        std::unexpected("Failed to post GUI animation stop task")
+    );
 }
 
 std::expected<void, std::string> System::gui_scroll_to(
@@ -1737,6 +1765,50 @@ std::expected<GuiBatchResult, std::string> System::gui_execute_batch(
     },
     std::unexpected("Failed to post GUI batch task")
            );
+}
+
+// Wait for input work first, then flush every binding queued for this app.
+std::expected<void, std::string> System::gui_drain_pending_work(AppId app_id)
+{
+    auto input_result = impl_->run_task_sync<std::expected<void, std::string>>(
+        SYSTEM_GUI_INPUT_TASK_GROUP,
+        [this, app_id]() -> std::expected<void, std::string> {
+            auto record_result = impl_->get_record(app_id);
+            if (!record_result) {
+                return std::unexpected(record_result.error());
+            }
+            if (!impl_->gui_runtime_) {
+                return std::unexpected("GUI runtime is not available");
+            }
+            if (!record_result.value()->document_id.has_value()) {
+                return std::unexpected("App GUI document is not loaded");
+            }
+            return {};
+        },
+        std::unexpected("Failed to drain GUI input work")
+    );
+    if (!input_result) {
+        return input_result;
+    }
+
+    return impl_->run_task_sync<std::expected<void, std::string>>(
+        SYSTEM_GUI_TASK_GROUP,
+        [this, app_id]() -> std::expected<void, std::string> {
+            auto record_result = impl_->get_record(app_id);
+            if (!record_result) {
+                return std::unexpected(record_result.error());
+            }
+            if (!impl_->gui_runtime_) {
+                return std::unexpected("GUI runtime is not available");
+            }
+            if (!record_result.value()->document_id.has_value()) {
+                return std::unexpected("App GUI document is not loaded");
+            }
+            impl_->flush_pending_gui_bindings(app_id);
+            return {};
+        },
+        std::unexpected("Failed to drain GUI binding work")
+    );
 }
 
 std::expected<void, std::string> System::set_gui_view_debug_enabled(bool enabled)

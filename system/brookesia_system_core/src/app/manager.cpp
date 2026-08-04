@@ -60,6 +60,23 @@ std::string with_cleanup_failure(
     return operation_error;
 }
 
+// Retain every completion-cleanup failure while allowing the remaining requests to close.
+void append_cleanup_failure(
+    std::expected<void, std::string> &result,
+    std::string_view operation,
+    std::string_view error
+)
+{
+    if (result) {
+        std::string contextual_error(operation);
+        contextual_error += " failed: ";
+        contextual_error += error;
+        result = std::unexpected(std::move(contextual_error));
+        return;
+    }
+    result = std::unexpected(with_cleanup_failure(result.error(), operation, error));
+}
+
 } // namespace
 
 
@@ -483,6 +500,7 @@ std::expected<void, std::string> System::install_registered_apps()
     return {};
 }
 
+// Uninstall an app while preserving failures from closing its app-owned input requests.
 std::expected<void, std::string> System::uninstall_app(AppId app_id)
 {
     BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
@@ -516,16 +534,14 @@ std::expected<void, std::string> System::uninstall_app(AppId app_id)
         }
     }
     on_hide_app_loading(record.info.app_id);
-    std::vector<KeyboardRequestId> uninstall_keyboard_requests;
-    for (const auto &[request_id, keyboard] : impl_->keyboard_requests_) {
-        if (keyboard.app_id == record.info.app_id) {
-            uninstall_keyboard_requests.push_back(request_id);
-        }
+    auto input_cleanup_result = close_app_input_requests(record.info.app_id);
+    if (!input_cleanup_result) {
+        BROOKESIA_LOGW(
+            "Failed to close app input requests while uninstalling: app_id(%1%), error(%2%)",
+            app_id,
+            input_cleanup_result.error()
+        );
     }
-    for (const auto request_id : uninstall_keyboard_requests) {
-        (void)hide_app_keyboard(record.info.app_id, request_id);
-    }
-    close_message_dialogs_for_app(record.info.app_id);
     impl_->cancel_app_timers(record);
     impl_->unload_runtime(record);
     auto cleanup_result = impl_->run_task_sync<std::expected<void, std::string>>(
@@ -538,9 +554,17 @@ std::expected<void, std::string> System::uninstall_app(AppId app_id)
                           );
     if (!cleanup_result) {
         BROOKESIA_LOGW("Failed to cleanup app GUI while uninstalling app: %1%", cleanup_result.error());
+        auto cleanup_error = cleanup_result.error();
+        if (!input_cleanup_result) {
+            cleanup_error = with_cleanup_failure(
+                                std::move(cleanup_error),
+                                "app input request cleanup",
+                                input_cleanup_result.error()
+                            );
+        }
         record.info.state = AppState::Error;
-        record.info.last_error = cleanup_result.error();
-        return std::unexpected(cleanup_result.error());
+        record.info.last_error = cleanup_error;
+        return std::unexpected(std::move(cleanup_error));
     }
     if (record.info.manifest.kind == AppKind::Runtime) {
         if (record.info.manifest.app_path.empty()) {
@@ -568,7 +592,7 @@ std::expected<void, std::string> System::uninstall_app(AppId app_id)
         BROOKESIA_LOGW("App uninstall hook failed: id(%1%), error(%2%)", app_id, hook_result.error());
     }
     BROOKESIA_LOGI("App uninstalled: id(%1%)", app_id);
-    return {};
+    return input_cleanup_result;
 }
 
 std::expected<void, std::string> System::start_app(AppId app_id)
@@ -596,6 +620,8 @@ std::expected<void, std::string> System::start_app(AppId app_id, const AppStartO
     if (record.info.state == AppState::Running) {
         return {};
     }
+    // A fresh lifecycle must never inherit a prior power/input gate.
+    record.input_quiesced = false;
     const auto start_profile_started_at = SteadyClock::now();
     auto log_start_profile = [&](const char *stage, SteadyTimePoint stage_started_at) {
         const auto now = SteadyClock::now();
@@ -923,6 +949,7 @@ std::expected<void, std::string> System::start_app(AppId app_id, const AppStartO
     return {};
 }
 
+// Stop an app while closing every app-owned input request and retaining dispatch failures.
 std::expected<void, std::string> System::stop_app(AppId app_id)
 {
     BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
@@ -942,32 +969,20 @@ std::expected<void, std::string> System::stop_app(AppId app_id)
     auto &record = *record_result.value();
     if (record.info.state == AppState::Stopped || record.info.state == AppState::Installed) {
         on_hide_app_loading(app_id);
-        std::vector<KeyboardRequestId> keyboard_requests;
-        for (const auto &[request_id, keyboard] : impl_->keyboard_requests_) {
-            if (keyboard.app_id == app_id) {
-                keyboard_requests.push_back(request_id);
-            }
-        }
-        for (const auto request_id : keyboard_requests) {
-            (void)hide_app_keyboard(app_id, request_id);
-        }
-        close_message_dialogs_for_app(app_id);
-        return {};
+        return close_app_input_requests(app_id);
     }
     auto heap_before_stop = heap_trace::capture();
     heap_trace::log("system.stop", "before stop", record.info.manifest.id, heap_before_stop);
     record.info.state = AppState::Stopping;
     on_hide_app_loading(app_id);
-    std::vector<KeyboardRequestId> keyboard_requests;
-    for (const auto &[request_id, keyboard] : impl_->keyboard_requests_) {
-        if (keyboard.app_id == app_id) {
-            keyboard_requests.push_back(request_id);
-        }
+    auto input_cleanup_result = close_app_input_requests(app_id);
+    if (!input_cleanup_result) {
+        BROOKESIA_LOGW(
+            "Failed to close app input requests while stopping: app_id(%1%), error(%2%)",
+            app_id,
+            input_cleanup_result.error()
+        );
     }
-    for (const auto request_id : keyboard_requests) {
-        (void)hide_app_keyboard(app_id, request_id);
-    }
-    close_message_dialogs_for_app(app_id);
     std::expected<void, std::string> stop_result = {};
     if (record.info.manifest.kind == AppKind::Native) {
         if (record.native_app && record.context) {
@@ -1007,6 +1022,19 @@ std::expected<void, std::string> System::stop_app(AppId app_id)
             );
         }
         record.runtime_started = false;
+    }
+    if (!input_cleanup_result) {
+        if (!stop_result) {
+            stop_result = std::unexpected(
+                              with_cleanup_failure(
+                                  stop_result.error(),
+                                  "app input request cleanup",
+                                  input_cleanup_result.error()
+                              )
+                          );
+        } else {
+            stop_result = std::unexpected(input_cleanup_result.error());
+        }
     }
     // AppState::Stopping already prevents timer dispatch. Let the app release
     // its own timer IDs first, then enforce cleanup even if on_stop() failed.
@@ -1135,6 +1163,83 @@ std::expected<void, std::string> System::resume_app(AppId app_id)
     return {};
 }
 
+// Gate app-scoped input, then drain queued AppInput and GUI work asynchronously.
+std::expected<void, std::string> System::app_quiesce_input(
+    AppId app_id,
+    AppInputQuiescedHandler on_drained
+)
+{
+    if (impl_->should_schedule_app_task()) {
+        return impl_->run_task_sync<std::expected<void, std::string>>(
+            SYSTEM_APP_TASK_GROUP,
+            [this, app_id, on_drained = std::move(on_drained)]() mutable {
+                return app_quiesce_input(app_id, std::move(on_drained));
+            },
+            std::unexpected("Failed to post app input quiescence task")
+        );
+    }
+
+    auto record_result = impl_->get_record(app_id);
+    if (!record_result) {
+        return std::unexpected(record_result.error());
+    }
+    auto &record = *record_result.value();
+    record.input_quiesced = true;
+
+    auto barrier_result = impl_->post_app_input_barrier(
+        app_id,
+        [this, app_id, on_drained = std::move(on_drained)]() mutable {
+            auto drain_result = gui_drain_pending_work(app_id);
+            if (!drain_result) {
+                BROOKESIA_LOGW(
+                    "App input quiescence drain failed: app_id(%1%), error(%2%)",
+                    app_id,
+                    drain_result.error()
+                );
+            }
+            if (on_drained) {
+                on_drained(std::move(drain_result));
+            }
+        }
+    );
+    if (!barrier_result) {
+        record.input_quiesced = false;
+        BROOKESIA_LOGW(
+            "Failed to post app input quiescence barrier: app_id(%1%), error(%2%)",
+            app_id,
+            barrier_result.error()
+        );
+        return std::unexpected(
+            "Failed to post app input quiescence barrier: " +
+            barrier_result.error()
+        );
+    }
+    return {};
+}
+
+
+// Reopen app-scoped input only after the owner has restored its active state.
+std::expected<void, std::string> System::app_resume_input(AppId app_id)
+{
+    if (impl_->should_schedule_app_task()) {
+        return impl_->run_task_sync<std::expected<void, std::string>>(
+            SYSTEM_APP_TASK_GROUP,
+            [this, app_id]() {
+                return app_resume_input(app_id);
+            },
+            std::unexpected("Failed to post app input resume task")
+        );
+    }
+
+    auto record_result = impl_->get_record(app_id);
+    if (!record_result) {
+        return std::unexpected(record_result.error());
+    }
+    record_result.value()->input_quiesced = false;
+    return {};
+}
+
+
 std::expected<void, std::string> System::request_close_app(AppId app_id)
 {
     return stop_app(app_id);
@@ -1199,6 +1304,41 @@ std::expected<KeyboardRequestId, std::string> System::show_app_keyboard(
     return request_id;
 }
 
+// Publish keyboard closure system-wide while dispatching its app callback through AppInput.
+std::expected<void, std::string> System::publish_keyboard_closed(
+    KeyboardResult result,
+    KeyboardResultHandler handler
+)
+{
+    std::expected<void, std::string> callback_result = {};
+    if (handler) {
+        callback_result = impl_->post_app_input_task(
+            result.app_id,
+            [handler = std::move(handler), result]() mutable {
+                handler(result);
+            }
+        );
+        if (!callback_result) {
+            BROOKESIA_LOGW(
+                "Failed to post app keyboard completion callback: app_id(%1%), request_id(%2%), error(%3%)",
+                result.app_id,
+                result.request_id,
+                callback_result.error()
+            );
+        }
+    }
+    if (impl_->system_service_) {
+        impl_->system_service_->publish_keyboard_closed(result);
+    }
+    if (!callback_result) {
+        return std::unexpected(
+                   "Failed to post app keyboard completion callback: " + callback_result.error()
+               );
+    }
+    return {};
+}
+
+// Close a keyboard request and queue its cancelled completion behind prior app input.
 std::expected<void, std::string> System::hide_app_keyboard(AppId app_id, KeyboardRequestId request_id)
 {
     if (impl_->should_schedule_app_task()) {
@@ -1228,15 +1368,10 @@ std::expected<void, std::string> System::hide_app_keyboard(AppId app_id, Keyboar
         .confirmed = false,
         .text = {},
     };
-    if (record.handler) {
-        record.handler(result);
-    }
-    if (impl_->system_service_) {
-        impl_->system_service_->publish_keyboard_closed(result);
-    }
-    return {};
+    return publish_keyboard_closed(std::move(result), std::move(record.handler));
 }
 
+// Complete a keyboard request and queue its confirmed result behind prior app input.
 std::expected<void, std::string> System::complete_app_keyboard(
     AppId app_id,
     KeyboardRequestId request_id,
@@ -1270,13 +1405,7 @@ std::expected<void, std::string> System::complete_app_keyboard(
         .confirmed = confirmed,
         .text = std::move(text),
     };
-    if (record.handler) {
-        record.handler(result);
-    }
-    if (impl_->system_service_) {
-        impl_->system_service_->publish_keyboard_closed(result);
-    }
-    return {};
+    return publish_keyboard_closed(std::move(result), std::move(record.handler));
 }
 
 std::expected<MessageDialogRequestId, std::string> System::show_app_message_dialog(
@@ -1455,12 +1584,14 @@ std::expected<MessageDialogRequestId, std::string> System::enqueue_message_dialo
     return request_id;
 }
 
+// Advance the dialog queue without losing completion-dispatch failures from rejected entries.
 std::expected<void, std::string> System::show_next_message_dialog()
 {
     if (impl_->active_message_dialog_request_id_.has_value()) {
         return {};
     }
 
+    std::expected<void, std::string> completion_result = {};
     while (!impl_->queued_message_dialog_requests_.empty()) {
         const auto request_id = impl_->queued_message_dialog_requests_.front();
         impl_->queued_message_dialog_requests_.erase(impl_->queued_message_dialog_requests_.begin());
@@ -1472,27 +1603,39 @@ std::expected<void, std::string> System::show_next_message_dialog()
         impl_->active_message_dialog_request_id_ = request_id;
         auto show_result = on_show_message_dialog(it->second.app_id, request_id, it->second.options);
         if (show_result) {
-            return {};
+            return completion_result;
         }
 
         BROOKESIA_LOGW("Failed to show queued message dialog: %1%", show_result.error());
         auto record = std::move(it->second);
         impl_->message_dialog_requests_.erase(it);
         impl_->active_message_dialog_request_id_.reset();
-        publish_message_dialog_closed(
-        MessageDialogResult{
-            .request_id = record.request_id,
-            .app_id = record.app_id,
-            .button_index = -1,
-            .button_role = MessageDialogButtonRole::Invalid,
-            .reason = MessageDialogCloseReason::Closed,
-        },
-        std::move(record.handler)
+        auto publish_result = publish_message_dialog_closed(
+            MessageDialogResult{
+                .request_id = record.request_id,
+                .app_id = record.app_id,
+                .button_index = -1,
+                .button_role = MessageDialogButtonRole::Invalid,
+                .reason = MessageDialogCloseReason::Closed,
+            },
+            std::move(record.handler)
         );
+        if (!publish_result) {
+            BROOKESIA_LOGW(
+                "Failed to dispatch rejected queued message dialog completion: request_id(%1%), error(%2%)",
+                record.request_id,
+                publish_result.error()
+            );
+            append_cleanup_failure(
+                completion_result,
+                "queued message dialog completion dispatch",
+                publish_result.error()
+            );
+        }
     }
 
     on_message_dialog_idle();
-    return {};
+    return completion_result;
 }
 
 void System::remove_queued_message_dialog(MessageDialogRequestId request_id)
@@ -1501,16 +1644,45 @@ void System::remove_queued_message_dialog(MessageDialogRequestId request_id)
     queue.erase(std::remove(queue.begin(), queue.end(), request_id), queue.end());
 }
 
-void System::publish_message_dialog_closed(MessageDialogResult result, MessageDialogResultHandler handler)
+// Publish dialog closure system-wide while gating only app-owned completion callbacks.
+std::expected<void, std::string> System::publish_message_dialog_closed(
+    MessageDialogResult result,
+    MessageDialogResultHandler handler
+)
 {
+    std::expected<void, std::string> callback_result = {};
     if (handler) {
-        handler(result);
+        if (result.app_id == INVALID_APP_ID) {
+            handler(result);
+        } else {
+            callback_result = impl_->post_app_input_task(
+                result.app_id,
+                [handler = std::move(handler), result]() mutable {
+                    handler(result);
+                }
+            );
+            if (!callback_result) {
+                BROOKESIA_LOGW(
+                    "Failed to post app message dialog completion callback: app_id(%1%), request_id(%2%), error(%3%)",
+                    result.app_id,
+                    result.request_id,
+                    callback_result.error()
+                );
+            }
+        }
     }
     if (impl_->system_service_) {
         impl_->system_service_->publish_message_dialog_closed(result);
     }
+    if (!callback_result) {
+        return std::unexpected(
+                   "Failed to post app message dialog completion callback: " + callback_result.error()
+               );
+    }
+    return {};
 }
 
+// Close one active or queued dialog, dispatch completion, then preserve queue progress and errors.
 std::expected<void, std::string> System::close_message_dialog(
     AppId app_id,
     MessageDialogRequestId request_id,
@@ -1564,21 +1736,33 @@ std::expected<void, std::string> System::close_message_dialog(
 
     auto record = std::move(it->second);
     impl_->message_dialog_requests_.erase(it);
-    publish_message_dialog_closed(
-    MessageDialogResult{
-        .request_id = record.request_id,
-        .app_id = record.app_id,
-        .button_index = button_index,
-        .button_role = button_role,
-        .reason = reason,
-    },
-    std::move(record.handler)
+    auto publish_result = publish_message_dialog_closed(
+        MessageDialogResult{
+            .request_id = record.request_id,
+            .app_id = record.app_id,
+            .button_index = button_index,
+            .button_role = button_role,
+            .reason = reason,
+        },
+        std::move(record.handler)
     );
 
     if (was_active) {
-        return show_next_message_dialog();
+        auto show_result = show_next_message_dialog();
+        if (!show_result) {
+            if (!publish_result) {
+                return std::unexpected(
+                           with_cleanup_failure(
+                               publish_result.error(),
+                               "show next message dialog",
+                               show_result.error()
+                           )
+                       );
+            }
+            return show_result;
+        }
     }
-    return {};
+    return publish_result;
 }
 
 std::expected<void, std::string> System::update_message_dialog(
@@ -1627,8 +1811,46 @@ std::expected<void, std::string> System::update_message_dialog(
     return on_update_message_dialog(it->second.app_id, request_id, it->second.options);
 }
 
-void System::close_message_dialogs_for_app(AppId app_id)
+// Close every keyboard and dialog request owned by one app without discarding any failure.
+std::expected<void, std::string> System::close_app_input_requests(AppId app_id)
 {
+    std::expected<void, std::string> close_result = {};
+    std::vector<KeyboardRequestId> keyboard_request_ids;
+    for (const auto &[request_id, keyboard] : impl_->keyboard_requests_) {
+        if (keyboard.app_id == app_id) {
+            keyboard_request_ids.push_back(request_id);
+        }
+    }
+
+    for (const auto request_id : keyboard_request_ids) {
+        auto hide_result = hide_app_keyboard(app_id, request_id);
+        if (!hide_result) {
+            BROOKESIA_LOGW(
+                "Failed to close app keyboard request: app_id(%1%), request_id(%2%), error(%3%)",
+                app_id,
+                request_id,
+                hide_result.error()
+            );
+            append_cleanup_failure(close_result, "keyboard request cleanup", hide_result.error());
+        }
+    }
+
+    auto dialog_result = close_message_dialogs_for_app(app_id);
+    if (!dialog_result) {
+        BROOKESIA_LOGW(
+            "Failed to close app message dialogs: app_id(%1%), error(%2%)",
+            app_id,
+            dialog_result.error()
+        );
+        append_cleanup_failure(close_result, "message dialog cleanup", dialog_result.error());
+    }
+    return close_result;
+}
+
+// Cancel every active or queued dialog owned by one app and retain all dispatch failures.
+std::expected<void, std::string> System::close_message_dialogs_for_app(AppId app_id)
+{
+    std::expected<void, std::string> close_result = {};
     std::vector<MessageDialogRequestId> request_ids;
     for (const auto &[request_id, request] : impl_->message_dialog_requests_) {
         if (request.app_id == app_id) {
@@ -1655,24 +1877,39 @@ void System::close_message_dialogs_for_app(AppId app_id)
 
         auto record = std::move(it->second);
         impl_->message_dialog_requests_.erase(it);
-        publish_message_dialog_closed(
-        MessageDialogResult{
-            .request_id = record.request_id,
-            .app_id = record.app_id,
-            .button_index = -1,
-            .button_role = MessageDialogButtonRole::Invalid,
-            .reason = MessageDialogCloseReason::Closed,
-        },
-        std::move(record.handler)
+        auto publish_result = publish_message_dialog_closed(
+            MessageDialogResult{
+                .request_id = record.request_id,
+                .app_id = record.app_id,
+                .button_index = -1,
+                .button_role = MessageDialogButtonRole::Invalid,
+                .reason = MessageDialogCloseReason::Closed,
+            },
+            std::move(record.handler)
         );
+        if (!publish_result) {
+            BROOKESIA_LOGW(
+                "Failed to dispatch app message dialog cancellation: app_id(%1%), request_id(%2%), error(%3%)",
+                app_id,
+                request_id,
+                publish_result.error()
+            );
+            append_cleanup_failure(
+                close_result,
+                "message dialog completion dispatch",
+                publish_result.error()
+            );
+        }
     }
 
     if (closed_active) {
         auto show_result = show_next_message_dialog();
         if (!show_result) {
             BROOKESIA_LOGW("Failed to show next message dialog after app cleanup: %1%", show_result.error());
+            append_cleanup_failure(close_result, "show next message dialog", show_result.error());
         }
     }
+    return close_result;
 }
 
 std::vector<AppInfo> System::list_apps() const

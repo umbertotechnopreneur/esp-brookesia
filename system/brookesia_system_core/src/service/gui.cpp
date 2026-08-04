@@ -795,6 +795,7 @@ FunctionResult GuiService::start_view_animation(FunctionParameterMap &&params)
     return make_success(static_cast<double>(*animation_id));
 }
 
+// Return the underlying animation cancellation error to runtime callers.
 FunctionResult GuiService::stop_animation(FunctionParameterMap &&params)
 {
     auto app_id = system_.get_current_runtime_app_owner();
@@ -808,9 +809,14 @@ FunctionResult GuiService::stop_animation(FunctionParameterMap &&params)
     if (!animation_id) {
         return make_error(animation_id.error());
     }
-    return system_.gui_stop_animation(*app_id, static_cast<gui::SubscriptionId>(*animation_id)) ?
-           make_success() :
-           make_error("Failed to stop animation");
+    auto stop_result = system_.gui_stop_animation(
+        *app_id,
+        static_cast<gui::SubscriptionId>(*animation_id)
+    );
+    if (!stop_result) {
+        return make_error(stop_result.error());
+    }
+    return make_success();
 }
 
 FunctionResult GuiService::scroll_to_view(FunctionParameterMap &&params)

@@ -121,6 +121,9 @@ bool TaskScheduler::start(const StartConfig &config)
     }
 
     worker_wait_slot_count_.store(0);
+    worker_wake_generation_.store(0);
+    external_executor_exposed_.store(false);
+    worker_poll_interval_ms_ = config.worker_poll_interval_ms;
 
     lib_utils::FunctionGuard stop_guard([this, &lock]() {
         BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
@@ -167,7 +170,7 @@ bool TaskScheduler::start(const StartConfig &config)
 
     for (const auto &thread_config : config.worker_configs) {
         auto thread_func =
-        [this, name = thread_config.name, poll_interval_ms = config.worker_poll_interval_ms] {
+        [this, name = thread_config.name] {
             BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
 
             BROOKESIA_LOGD("Worker thread (%1%) started", name);
@@ -179,9 +182,10 @@ bool TaskScheduler::start(const StartConfig &config)
             while (!boost::this_thread::interruption_requested() && !io_context_->stopped())
             {
                 try {
+                    const uint64_t observed_generation = worker_wake_generation_.load(std::memory_order_acquire);
                     size_t executed = io_context_->poll();
                     if (executed == 0) {
-                        boost::this_thread::sleep_for(boost::chrono::milliseconds(poll_interval_ms));
+                        wait_for_work(observed_generation);
                     }
                 } catch (const boost::thread_interrupted &) {
                     BROOKESIA_LOGD("Worker thread (%1%) interrupted", name);
@@ -220,6 +224,9 @@ void TaskScheduler::stop()
         for (auto& [id, handle] : tasks_) {
             handle->state = TaskState::Canceled;
             if (handle->timer) {
+                boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+                ++handle->worker_deadline_generation;
+                handle->worker_deadline.reset();
                 handle->timer->cancel();
                 handle->timer.reset(); // Immediately release timer
             }
@@ -237,6 +244,7 @@ void TaskScheduler::stop()
 
     // Stop io_context
     io_context_->stop();
+    notify_workers();
 
     // Wait for all threads to finish
     BROOKESIA_LOGD("Interrupting %1% worker threads and waiting for them to finish", threads_.size());
@@ -261,6 +269,83 @@ void TaskScheduler::stop()
     BROOKESIA_LOGD(
         "Stopped, canceled %1% tasks, statistics: %2%", task_count, BROOKESIA_DESCRIBE_TO_STR(get_statistics())
     );
+}
+
+// Wake blocked workers whenever posted work or timer state changes.
+void TaskScheduler::notify_workers()
+{
+    {
+        boost::lock_guard<boost::mutex> lock(worker_wait_mutex_);
+        worker_wake_generation_.fetch_add(1, std::memory_order_release);
+    }
+    worker_wait_cv_.notify_all();
+}
+
+// Block without polling while preserving the next Boost.Asio steady-timer deadline.
+void TaskScheduler::wait_for_work(uint64_t observed_generation)
+{
+    auto next_expiry = get_next_timer_expiry();
+    if (external_executor_exposed_.load(std::memory_order_acquire)) {
+        const auto fallback_expiry =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(worker_poll_interval_ms_);
+        if (!next_expiry.has_value() || fallback_expiry < *next_expiry) {
+            next_expiry = fallback_expiry;
+        }
+    }
+    boost::unique_lock<boost::mutex> lock(worker_wait_mutex_);
+    auto should_wake = [this, observed_generation]() {
+        return worker_wake_generation_.load(std::memory_order_acquire) != observed_generation ||
+               boost::this_thread::interruption_requested() || io_context_->stopped();
+    };
+
+    if (should_wake()) {
+        return;
+    }
+
+    if (!next_expiry.has_value()) {
+        // The notifier takes worker_wait_mutex_, so the check above and this atomic
+        // unlock-and-wait cannot lose a generation change.
+        worker_wait_cv_.wait(lock);
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (*next_expiry <= now) {
+        return;
+    }
+
+    const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(*next_expiry - now).count();
+    // Use the non-predicate overload: on ESP the Boost predicate overload converts
+    // clocks in 100 ms slices, causing avoidable wakeups before long timer deadlines.
+    worker_wait_cv_.wait_for(lock, boost::chrono::microseconds(wait_us));
+}
+
+// Derive the idle wait bound from active delayed and periodic tasks only.
+std::optional<std::chrono::steady_clock::time_point> TaskScheduler::get_next_timer_expiry() const
+{
+    std::optional<std::chrono::steady_clock::time_point> next_expiry;
+    boost::lock_guard<boost::mutex> lock(mutex_);
+    boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+    for (const auto &[id, handle] : tasks_) {
+        (void)id;
+        if (!handle || handle->state != TaskState::Running || !handle->worker_deadline.has_value()) {
+            continue;
+        }
+        const auto expiry = *handle->worker_deadline;
+        if (!next_expiry.has_value() || expiry < *next_expiry) {
+            next_expiry = expiry;
+        }
+    }
+    return next_expiry;
+}
+
+// Remove only the deadline belonging to the callback that is currently firing.
+void TaskScheduler::clear_timer_deadline(const std::shared_ptr<TaskHandle> &handle, uint64_t expected_generation)
+{
+    boost::lock_guard<boost::mutex> lock(timer_mutex_);
+    if (handle->worker_deadline_generation == expected_generation) {
+        handle->worker_deadline.reset();
+    }
 }
 
 bool TaskScheduler::post_internal(OnceTask task, TaskId *id, const Group &group, bool enable_immediate)
@@ -329,6 +414,7 @@ bool TaskScheduler::post_internal(OnceTask task, TaskId *id, const Group &group,
             boost::asio::post(*io_context_, std::move(task_wrapper));
         }
     }
+    notify_workers();
 
     if (id) {
         *id = handle->id;
@@ -774,8 +860,14 @@ bool TaskScheduler::restart_timer(TaskId id)
 
     // Cancel current timer and reschedule with original interval
     if (handle->timer) {
-        handle->timer->cancel();
-        // Note: schedule_once/schedule_periodic will call expires_after internally
+        {
+            boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+            ++handle->worker_deadline_generation;
+            handle->worker_deadline.reset();
+            handle->timer->cancel();
+        }
+        notify_workers();
+        // Note: schedule_once/schedule_periodic will set the next expiry internally
 
         if (handle->type == TaskType::Delayed) {
             // For Delayed task, reschedule with saved task
@@ -986,11 +1078,14 @@ std::shared_ptr<TaskScheduler::TaskHandle> TaskScheduler::create_handle(
         total_tasks_++;
     }
 
-    // Create timer with strand executor if available, otherwise use io_context executor
-    if (strand) {
-        handle->timer = std::make_shared<boost::asio::steady_timer>(*strand);
-    } else {
-        handle->timer = std::make_shared<boost::asio::steady_timer>(*io_context_);
+    // Create timer with strand executor if available, otherwise use io_context executor.
+    {
+        boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+        if (strand) {
+            handle->timer = std::make_shared<boost::asio::steady_timer>(*strand);
+        } else {
+            handle->timer = std::make_shared<boost::asio::steady_timer>(*io_context_);
+        }
     }
     handle->promise = std::make_shared<boost::promise<bool>>();
     handle->future = handle->promise->get_future().share();
@@ -1000,134 +1095,148 @@ std::shared_ptr<TaskScheduler::TaskHandle> TaskScheduler::create_handle(
     return handle;
 }
 
-void TaskScheduler::schedule_once(std::shared_ptr<TaskHandle> handle, OnceTask task)
-{
+void TaskScheduler::schedule_once(std::shared_ptr<TaskHandle> handle, OnceTask task) {
     BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
 
     BROOKESIA_LOGD("Params: handle(Task[%1%])", handle->id);
 
-    handle->timer->expires_after(std::chrono::milliseconds(handle->interval_ms));
-    handle->timer->async_wait([this, handle, task = std::move(task)](const boost::system::error_code & ec) {
-        BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(handle->interval_ms);
+    uint64_t deadline_generation = 0;
+    {
+        boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+        deadline_generation = ++handle->worker_deadline_generation;
+        handle->worker_deadline = deadline;
+        handle->timer->expires_at(deadline);
+        handle->timer->async_wait(
+            [this, handle, deadline_generation, task = std::move(task)](const boost::system::error_code &ec) {
+                BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
 
-        BROOKESIA_LOGD("Params: ec(%1%)", ec);
+                BROOKESIA_LOGD("Params: ec(%1%)", ec);
+                clear_timer_deadline(handle, deadline_generation);
 
-        // If suspended, don't remove the task - it will be resumed later
-        if (handle->state == TaskState::Suspended) {
-            BROOKESIA_LOGD(
-                "Task[%1%] is %2%, keeping it alive", handle->id, BROOKESIA_DESCRIBE_TO_STR(handle->state.load())
-            );
-            return;
-        }
+                // If suspended, don't remove the task - it will be resumed later
+                if (handle->state == TaskState::Suspended) {
+                    BROOKESIA_LOGD("Task[%1%] is %2%, keeping it alive", handle->id,
+                                   BROOKESIA_DESCRIBE_TO_STR(handle->state.load()));
+                    return;
+                }
 
-        if (ec || handle->state == TaskState::Canceled) {
-            // If operation_aborted but task is still Running, it means restart_timer was called
-            // Don't remove the task in this case - a new timer has been scheduled
-            if (ec == boost::asio::error::operation_aborted && handle->state == TaskState::Running) {
-                BROOKESIA_LOGD("Task[%1%] timer was restarted, not removing", handle->id);
-                return;
-            }
-            boost::lock_guard<boost::mutex> lock(mutex_);
-            remove_task_internal(handle->id, handle->group);
-            return;
-        }
+                if (ec || handle->state == TaskState::Canceled) {
+                    // If operation_aborted but task is still Running, it means restart_timer was called
+                    // Don't remove the task in this case - a new timer has been scheduled
+                    if (ec == boost::asio::error::operation_aborted && handle->state == TaskState::Running) {
+                        BROOKESIA_LOGD("Task[%1%] timer was restarted, not removing", handle->id);
+                        return;
+                    }
+                    boost::lock_guard<boost::mutex> lock(mutex_);
+                    remove_task_internal(handle->id, handle->group);
+                    return;
+                }
 
-        // Invoke pre-execute callback when task is about to execute
-        invoke_pre_execute_callback(handle->id, handle->type, handle->group);
+                // Invoke pre-execute callback when task is about to execute
+                invoke_pre_execute_callback(handle->id, handle->type, handle->group);
 
-        bool success = false;
-        // Will be executed when the function exits
-        lib_utils::FunctionGuard exit_guard(
-        [this, handle, &success]() {
-            invoke_post_execute_callback(handle->id, handle->type, success, handle->group);
-            mark_finished(handle, success);
-        }
-        );
+                bool success = false;
+                // Will be executed when the function exits
+                lib_utils::FunctionGuard exit_guard([this, handle, &success]() {
+                    invoke_post_execute_callback(handle->id, handle->type, success, handle->group);
+                    mark_finished(handle, success);
+                });
 
-        BROOKESIA_CHECK_EXCEPTION_EXECUTE(task(), {
-            success = false;
-            return;
-        }, {BROOKESIA_LOGE("Delayed Task[%1%] execution failed", handle->id);});
+                BROOKESIA_CHECK_EXCEPTION_EXECUTE(
+                    task(),
+                    {
+                        success = false;
+                        return;
+                    },
+                    { BROOKESIA_LOGE("Delayed Task[%1%] execution failed", handle->id); });
 
-        success = true;
-    });
+                success = true;
+            });
+    }
+    notify_workers();
 }
 
-void TaskScheduler::schedule_periodic(std::shared_ptr<TaskHandle> handle, PeriodicTask task)
-{
+void TaskScheduler::schedule_periodic(std::shared_ptr<TaskHandle> handle, PeriodicTask task) {
     // BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
 
-    handle->timer->expires_after(std::chrono::milliseconds(handle->interval_ms));
-    handle->timer->async_wait([this, handle, task](const boost::system::error_code & ec) {
-        // BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(handle->interval_ms);
+    uint64_t deadline_generation = 0;
+    {
+        boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+        deadline_generation = ++handle->worker_deadline_generation;
+        handle->worker_deadline = deadline;
+        handle->timer->expires_at(deadline);
+        handle->timer->async_wait([this, handle, deadline_generation, task](const boost::system::error_code &ec) {
+            // BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
 
-        // BROOKESIA_LOGD("Params: ec(%1%)", ec);
+            // BROOKESIA_LOGD("Params: ec(%1%)", ec);
+            clear_timer_deadline(handle, deadline_generation);
 
-        // If suspended, don't remove the task - it will be resumed later
-        if (handle->state == TaskState::Suspended) {
-            BROOKESIA_LOGD(
-                "Periodic Task[%1%] is %2%, keeping it alive", handle->id,
-                BROOKESIA_DESCRIBE_TO_STR(handle->state.load())
-            );
-            return;
-        }
-
-        if (ec || handle->state == TaskState::Canceled) {
-            // If operation_aborted but task is still Running, it means restart_timer was called
-            // Don't remove the task in this case - a new timer has been scheduled
-            if (ec == boost::asio::error::operation_aborted && handle->state == TaskState::Running) {
-                BROOKESIA_LOGD("Periodic Task[%1%] timer was restarted, not removing", handle->id);
+            // If suspended, don't remove the task - it will be resumed later
+            if (handle->state == TaskState::Suspended) {
+                BROOKESIA_LOGD("Periodic Task[%1%] is %2%, keeping it alive", handle->id,
+                               BROOKESIA_DESCRIBE_TO_STR(handle->state.load()));
                 return;
             }
-            boost::lock_guard<boost::mutex> lock(mutex_);
-            remove_task_internal(handle->id, handle->group);
-            return;
-        }
 
-        // Check if task is already executing to prevent parallel execution
-        bool expected = false;
-        if (!handle->is_executing.compare_exchange_strong(expected, true)) {
-            BROOKESIA_LOGD(
-                "Periodic Task[%1%] is already executing, skipping this execution", handle->id
-            );
-            // Schedule next execution even if we skip this one
-            if (handle->repeat && handle->state == TaskState::Running) {
-                schedule_periodic(handle, task);
+            if (ec || handle->state == TaskState::Canceled) {
+                // If operation_aborted but task is still Running, it means restart_timer was called
+                // Don't remove the task in this case - a new timer has been scheduled
+                if (ec == boost::asio::error::operation_aborted && handle->state == TaskState::Running) {
+                    BROOKESIA_LOGD("Periodic Task[%1%] timer was restarted, not removing", handle->id);
+                    return;
+                }
+                boost::lock_guard<boost::mutex> lock(mutex_);
+                remove_task_internal(handle->id, handle->group);
+                return;
             }
-            return;
-        }
 
-        // Invoke pre-execute callback when task is about to execute
-        invoke_pre_execute_callback(handle->id, handle->type, handle->group);
-
-        bool success = false;
-        // Will be executed when the function exits
-        lib_utils::FunctionGuard exit_guard(
-        [this, handle, &success]() {
-            // Clear execution flag when task completes
-            handle->is_executing.store(false);
-            invoke_post_execute_callback(handle->id, handle->type, success, handle->group);
-        }
-        );
-
-        auto do_task = [this, handle, task, &success]() {
-            bool should_continue = task();
-            success = true;
-            if (should_continue && handle->repeat && handle->state == TaskState::Running) {
-                // Task will continue, not finished yet
-                schedule_periodic(handle, task);
-            } else {
-                // Task is finished
-                mark_finished(handle, true);
+            // Check if task is already executing to prevent parallel execution
+            bool expected = false;
+            if (!handle->is_executing.compare_exchange_strong(expected, true)) {
+                BROOKESIA_LOGD("Periodic Task[%1%] is already executing, skipping this execution", handle->id);
+                // Schedule next execution even if we skip this one
+                if (handle->repeat && handle->state == TaskState::Running) {
+                    schedule_periodic(handle, task);
+                }
+                return;
             }
-        };
-        BROOKESIA_CHECK_EXCEPTION_EXECUTE(do_task(), {
-            success = false;
-            handle->is_executing.store(false);
-            mark_finished(handle, false);
-            return;
-        }, {BROOKESIA_LOGE("Periodic Task[%1%] execution failed", handle->id);});
-    });
+
+            // Invoke pre-execute callback when task is about to execute
+            invoke_pre_execute_callback(handle->id, handle->type, handle->group);
+
+            bool success = false;
+            // Will be executed when the function exits
+            lib_utils::FunctionGuard exit_guard([this, handle, &success]() {
+                // Clear execution flag when task completes
+                handle->is_executing.store(false);
+                invoke_post_execute_callback(handle->id, handle->type, success, handle->group);
+            });
+
+            auto do_task = [this, handle, task, &success]() {
+                bool should_continue = task();
+                success = true;
+                if (should_continue && handle->repeat && handle->state == TaskState::Running) {
+                    // Task will continue, not finished yet
+                    schedule_periodic(handle, task);
+                } else {
+                    // Task is finished
+                    mark_finished(handle, true);
+                }
+            };
+            BROOKESIA_CHECK_EXCEPTION_EXECUTE(
+                do_task(),
+                {
+                    success = false;
+                    handle->is_executing.store(false);
+                    mark_finished(handle, false);
+                    return;
+                },
+                { BROOKESIA_LOGE("Periodic Task[%1%] execution failed", handle->id); });
+        });
+    }
+    notify_workers();
 }
 
 void TaskScheduler::cancel_internal(TaskId task_id)
@@ -1145,7 +1254,13 @@ void TaskScheduler::cancel_internal(TaskId task_id)
     auto &handle = it->second;
     handle->state = TaskState::Canceled;
     if (handle->timer) {
-        handle->timer->cancel();
+        {
+            boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+            ++handle->worker_deadline_generation;
+            handle->worker_deadline.reset();
+            handle->timer->cancel();
+        }
+        notify_workers();
     }
     canceled_tasks_++;
 
@@ -1193,11 +1308,17 @@ bool TaskScheduler::suspend_internal(TaskId task_id)
 
     // Cancel current timer and record remaining time
     if (handle->timer) {
-        auto expiry = handle->timer->expiry();
-        auto now = std::chrono::steady_clock::now();
-        handle->remaining_time = std::chrono::duration_cast<std::chrono::milliseconds>(expiry - now);
-        handle->suspend_time = now;
-        handle->timer->cancel();
+        {
+            boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+            auto expiry = handle->timer->expiry();
+            auto now = std::chrono::steady_clock::now();
+            handle->remaining_time = std::chrono::duration_cast<std::chrono::milliseconds>(expiry - now);
+            handle->suspend_time = now;
+            ++handle->worker_deadline_generation;
+            handle->worker_deadline.reset();
+            handle->timer->cancel();
+        }
+        notify_workers();
     }
 
     handle->state = TaskState::Suspended;
@@ -1208,8 +1329,7 @@ bool TaskScheduler::suspend_internal(TaskId task_id)
     return true;
 }
 
-bool TaskScheduler::resume_internal(TaskId task_id)
-{
+bool TaskScheduler::resume_internal(TaskId task_id) {
     BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
 
     BROOKESIA_LOGD("Params: task_id(Task[%1%])", task_id);
@@ -1225,17 +1345,14 @@ bool TaskScheduler::resume_internal(TaskId task_id)
     // Check if task type supports resume
     if (handle->type != TaskType::Delayed && handle->type != TaskType::Periodic) {
         BROOKESIA_LOGE(
-            "Task[%1%] cannot be resumed: only Delayed and Periodic tasks support resume (current type: %2%)",
-            task_id, BROOKESIA_DESCRIBE_TO_STR(handle->type)
-        );
+            "Task[%1%] cannot be resumed: only Delayed and Periodic tasks support resume (current type: %2%)", task_id,
+            BROOKESIA_DESCRIBE_TO_STR(handle->type));
         return false;
     }
 
     if (handle->state != TaskState::Suspended) {
-        BROOKESIA_LOGW(
-            "Task[%1%] is not in suspended state (current: %2%)", task_id,
-            BROOKESIA_DESCRIBE_TO_STR(handle->state.load())
-        );
+        BROOKESIA_LOGW("Task[%1%] is not in suspended state (current: %2%)", task_id,
+                       BROOKESIA_DESCRIBE_TO_STR(handle->state.load()));
         return false;
     }
 
@@ -1275,80 +1392,88 @@ bool TaskScheduler::resume_internal(TaskId task_id)
         auto remaining_time = handle->remaining_time.count();
         const int delay_ms = static_cast<int>(std::max(static_cast<decltype(remaining_time)>(0), remaining_time));
 
-        BROOKESIA_LOGD("Rescheduling periodic Task[%1%] with remaining time: %2% ms, then interval: %3% ms",
-                       task_id, delay_ms, handle->interval_ms);
+        BROOKESIA_LOGD("Rescheduling periodic Task[%1%] with remaining time: %2% ms, then interval: %3% ms", task_id,
+                       delay_ms, handle->interval_ms);
 
         // First execution with remaining time
-        handle->timer->expires_after(std::chrono::milliseconds(delay_ms));
-        handle->timer->async_wait([this, handle, original_interval = handle->interval_ms](const boost::system::error_code & ec) {
-            BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+        uint64_t deadline_generation = 0;
+        {
+            boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+            deadline_generation = ++handle->worker_deadline_generation;
+            handle->worker_deadline = deadline;
+            handle->timer->expires_at(deadline);
+            handle->timer->async_wait([this, handle, deadline_generation,
+                                       original_interval = handle->interval_ms](const boost::system::error_code &ec) {
+                BROOKESIA_LOG_TRACE_GUARD_WITH_THIS();
 
-            BROOKESIA_LOGD("Params: ec(%1%)", ec);
+                BROOKESIA_LOGD("Params: ec(%1%)", ec);
+                clear_timer_deadline(handle, deadline_generation);
 
-            // If suspended again, don't remove the task
-            if (handle->state == TaskState::Suspended) {
-                BROOKESIA_LOGD(
-                    "Resumed periodic Task[%1%] is %2%, keeping it alive", handle->id,
-                    BROOKESIA_DESCRIBE_TO_STR(handle->state.load())
-                );
-                return;
-            }
-
-            if (ec || handle->state == TaskState::Canceled) {
-                boost::lock_guard<boost::mutex> lock(mutex_);
-                remove_task_internal(handle->id, handle->group);
-                return;
-            }
-
-            // Check if task is already executing to prevent parallel execution
-            bool expected = false;
-            if (!handle->is_executing.compare_exchange_strong(expected, true)) {
-                BROOKESIA_LOGD(
-                    "Resumed periodic Task[%1%] is already executing, skipping this execution", handle->id
-                );
-                // Schedule next execution even if we skip this one
-                if (handle->repeat && handle->state == TaskState::Running) {
-                    handle->interval_ms = original_interval;
-                    schedule_periodic(handle, handle->saved_periodic_task);
+                // If suspended again, don't remove the task
+                if (handle->state == TaskState::Suspended) {
+                    BROOKESIA_LOGD("Resumed periodic Task[%1%] is %2%, keeping it alive", handle->id,
+                                   BROOKESIA_DESCRIBE_TO_STR(handle->state.load()));
+                    return;
                 }
-                return;
-            }
 
-            // Invoke pre-execute callback when task is about to execute
-            invoke_pre_execute_callback(handle->id, handle->type, handle->group);
-
-            bool success = false;
-            // Will be executed when the function exits
-            lib_utils::FunctionGuard exit_guard(
-            [this, handle, &success]() {
-                // Clear execution flag when task completes
-                handle->is_executing.store(false);
-                invoke_post_execute_callback(handle->id, handle->type, success, handle->group);
-            }
-            );
-
-            auto do_task = [this, handle, original_interval, &success]() {
-                bool should_continue = handle->saved_periodic_task();
-                success = true;
-
-                if (should_continue && handle->repeat && handle->state == TaskState::Running) {
-                    // Task will continue, not finished yet
-                    // Restore original interval for subsequent executions
-                    handle->interval_ms = original_interval;
-                    schedule_periodic(handle, handle->saved_periodic_task);
-                } else {
-                    // Task is finished
-                    mark_finished(handle, true);
+                if (ec || handle->state == TaskState::Canceled) {
+                    boost::lock_guard<boost::mutex> lock(mutex_);
+                    remove_task_internal(handle->id, handle->group);
+                    return;
                 }
-            };
 
-            BROOKESIA_CHECK_EXCEPTION_EXECUTE(do_task(), {
-                success = false;
-                handle->is_executing.store(false);
-                mark_finished(handle, false);
-                return;
-            }, {BROOKESIA_LOGE("Resumed periodic Task[%1%] execution failed", handle->id);});
-        });
+                // Check if task is already executing to prevent parallel execution
+                bool expected = false;
+                if (!handle->is_executing.compare_exchange_strong(expected, true)) {
+                    BROOKESIA_LOGD("Resumed periodic Task[%1%] is already executing, skipping this execution",
+                                   handle->id);
+                    // Schedule next execution even if we skip this one
+                    if (handle->repeat && handle->state == TaskState::Running) {
+                        handle->interval_ms = original_interval;
+                        schedule_periodic(handle, handle->saved_periodic_task);
+                    }
+                    return;
+                }
+
+                // Invoke pre-execute callback when task is about to execute
+                invoke_pre_execute_callback(handle->id, handle->type, handle->group);
+
+                bool success = false;
+                // Will be executed when the function exits
+                lib_utils::FunctionGuard exit_guard([this, handle, &success]() {
+                    // Clear execution flag when task completes
+                    handle->is_executing.store(false);
+                    invoke_post_execute_callback(handle->id, handle->type, success, handle->group);
+                });
+
+                auto do_task = [this, handle, original_interval, &success]() {
+                    bool should_continue = handle->saved_periodic_task();
+                    success = true;
+
+                    if (should_continue && handle->repeat && handle->state == TaskState::Running) {
+                        // Task will continue, not finished yet
+                        // Restore original interval for subsequent executions
+                        handle->interval_ms = original_interval;
+                        schedule_periodic(handle, handle->saved_periodic_task);
+                    } else {
+                        // Task is finished
+                        mark_finished(handle, true);
+                    }
+                };
+
+                BROOKESIA_CHECK_EXCEPTION_EXECUTE(
+                    do_task(),
+                    {
+                        success = false;
+                        handle->is_executing.store(false);
+                        mark_finished(handle, false);
+                        return;
+                    },
+                    { BROOKESIA_LOGE("Resumed periodic Task[%1%] execution failed", handle->id); });
+            });
+        }
+        notify_workers();
     }
 
     BROOKESIA_LOGD("Task[%1%] resumed and rescheduled", task_id);
@@ -1378,6 +1503,9 @@ void TaskScheduler::remove_task_internal(TaskId task_id, const Group &group)
     if (it != tasks_.end()) {
         // Ensure timer is canceled and cleaned up
         if (it->second && it->second->timer) {
+            boost::lock_guard<boost::mutex> timer_lock(timer_mutex_);
+            ++it->second->worker_deadline_generation;
+            it->second->worker_deadline.reset();
             it->second->timer->cancel();
             it->second->timer.reset();
         }

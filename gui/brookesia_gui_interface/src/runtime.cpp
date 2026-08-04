@@ -901,6 +901,15 @@ public:
         subscription_document_ids_[subscription_id] = document_id.value();
     }
 
+    // Report whether a subscription is still owned before idempotent cleanup.
+    bool has_subscription(SubscriptionId subscription_id) const
+    {
+        return subscription_registry_ != nullptr && subscription_id != 0 &&
+               subscription_registry_->disconnect_handlers.contains(
+                   subscription_id
+               );
+    }
+
     bool unsubscribe_subscription(SubscriptionId subscription_id)
     {
         if (subscription_registry_ == nullptr || subscription_id == 0) {
@@ -7594,6 +7603,12 @@ SubscriptionId Runtime::subscribe_event_action_with_id(
     ActionHandler handler)
 {
     return impl_->subscribe_event_action_with_id(this, id, action, std::move(handler));
+}
+
+// Report active ownership without changing the subscription registry.
+bool Runtime::has_subscription(SubscriptionId subscription_id) const
+{
+    return impl_->has_subscription(subscription_id);
 }
 
 bool Runtime::unsubscribe_subscription(SubscriptionId subscription_id)

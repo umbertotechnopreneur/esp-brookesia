@@ -118,7 +118,7 @@ std::expected<void, std::string> System::init(Config config)
                 BROOKESIA_LOGW("Failed to dispatch runtime app event: %1%", result.error());
             }
         };
-        return impl_->post_task(SYSTEM_APP_INPUT_TASK_GROUP, std::move(task));
+        return impl_->post_app_input_task(app_id, std::move(task));
     };
     impl_->host_bridge_ = std::make_shared<SystemHostBridge>(
                               std::make_shared<runtime::RuntimeFunctionBridge>(),

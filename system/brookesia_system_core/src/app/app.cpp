@@ -263,6 +263,35 @@ std::expected<GuiBatchResult, std::string> AppGuiRuntime::execute_batch(
     return system_->gui_execute_batch(app_id_, commands);
 }
 
+// Drain both serialized GUI domains before an external owner pauses rendering.
+std::expected<void, std::string> AppGuiRuntime::drain_pending_work() const
+{
+    if (system_ == nullptr) {
+        return std::unexpected("System is not available");
+    }
+    return system_->gui_drain_pending_work(app_id_);
+}
+
+// Close app-owned input and report after queued input and GUI work is drained.
+std::expected<void, std::string> AppGuiRuntime::quiesce_input(
+    AppInputQuiescedHandler on_drained
+) const
+{
+    if (system_ == nullptr) {
+        return std::unexpected("System is not available");
+    }
+    return system_->app_quiesce_input(app_id_, std::move(on_drained));
+}
+
+// Re-enable app-owned input after the app has restored its active UI state.
+std::expected<void, std::string> AppGuiRuntime::resume_input() const
+{
+    if (system_ == nullptr) {
+        return std::unexpected("System is not available");
+    }
+    return system_->app_resume_input(app_id_);
+}
+
 std::optional<std::string> AppGuiRuntime::get_binding_value(std::string_view absolute_path, std::string_view key) const
 {
     if (system_ == nullptr) {
@@ -475,9 +504,15 @@ std::expected<gui::RuntimeAnimationStartResult, std::string> AppGuiRuntime::star
     return system_->gui_start_view_animation_with_result(app_id_, absolute_path, animation, std::move(completed_handler));
 }
 
-bool AppGuiRuntime::stop_animation(gui::SubscriptionId subscription_id) const
+// Preserve the runtime's exact animation cancellation result for the app.
+std::expected<void, std::string> AppGuiRuntime::stop_animation(
+    gui::SubscriptionId subscription_id
+) const
 {
-    return (system_ != nullptr) && system_->gui_stop_animation(app_id_, subscription_id);
+    if (system_ == nullptr) {
+        return std::unexpected("System is not available");
+    }
+    return system_->gui_stop_animation(app_id_, subscription_id);
 }
 
 std::expected<void, std::string> AppGuiRuntime::set_view_debug_enabled(bool enabled) const

@@ -66,6 +66,7 @@ public:
         std::vector<std::string> registered_image_resource_ids;
         std::vector<std::string> registered_font_resource_ids;
         std::string registered_icon_resource_id;
+        bool input_quiesced = false;
         struct TimerRecord {
             std::string name;
             bool periodic = false;
@@ -126,6 +127,19 @@ public:
     );
     std::expected<void, std::string> post_task(
         const lib_utils::TaskScheduler::Group &group,
+        lib_utils::TaskScheduler::OnceTask task
+    );
+    std::expected<void, std::string> post_app_input_task(
+        AppId app_id,
+        lib_utils::TaskScheduler::OnceTask task
+    );
+    std::expected<void, std::string> enqueue_app_input_task(
+        AppId app_id,
+        lib_utils::TaskScheduler::OnceTask task,
+        bool bypass_quiesce
+    );
+    std::expected<void, std::string> post_app_input_barrier(
+        AppId app_id,
         lib_utils::TaskScheduler::OnceTask task
     );
     std::expected<GuiBatchResult, std::string> execute_gui_batch_now(
