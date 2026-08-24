@@ -100,6 +100,34 @@ constexpr std::string_view IMAGE_BINDING_JSON = R"({
     ]
 })";
 
+constexpr std::string_view BATCH_BINDING_JSON = R"({
+    "version": "0.1.1",
+    "assets": [{
+        "type": "viewScreen",
+        "id": "binding_screen",
+        "children": [
+            {
+                "type": "label",
+                "id": "status",
+                "bindings": {
+                    "labelProps.text": "text",
+                    "commonProps.hidden": "hidden",
+                    "style.textColor": "color",
+                    "style.bgColor": "background"
+                },
+                "labelProps": {"text": "Initial"},
+                "style": {"textColor": "#111827", "bgColor": "#F8FAFC"}
+            },
+            {
+                "type": "slider",
+                "id": "level",
+                "bindings": {"rangeProps.value": "level"},
+                "rangeProps": {"value": 30, "min": 0, "max": 100}
+            }
+        ]
+    }]
+})";
+
 std::string append_child_path(std::string_view parent_path, std::string_view id)
 {
     if (parent_path.empty() || parent_path == "/") {
@@ -321,6 +349,21 @@ public:
         return props_apply_count_;
     }
 
+    size_t layout_apply_count() const
+    {
+        return layout_apply_count_;
+    }
+
+    size_t placement_apply_count() const
+    {
+        return placement_apply_count_;
+    }
+
+    size_t style_apply_count() const
+    {
+        return style_apply_count_;
+    }
+
     const std::vector<RuntimeImageResource> &preloaded_images() const
     {
         return images_;
@@ -521,6 +564,139 @@ BROOKESIA_TEST_CASE(
 
     TEST_ASSERT_TRUE(runtime.scroll_view_to_visible(document_id.value(), "/test_screen/title", false));
     TEST_ASSERT_TRUE(runtime.unmount_screen(document_id.value(), "/test_screen"));
+    TEST_ASSERT_TRUE(runtime.unload(document_id.value()));
+}
+
+BROOKESIA_TEST_CASE(
+    test_gui_interface_runtime_batches_binding_updates,
+    "GUI interface runtime preserves two-phase binding batches and coalesces backend work",
+    "[gui][interface][runtime]"
+)
+{
+    auto backend = std::make_unique<MockBackend>();
+    auto *backend_ptr = backend.get();
+    Runtime runtime(std::move(backend));
+
+    Environment environment;
+    auto document_id = runtime.load_json("test/bindings.json", BATCH_BINDING_JSON, "test", environment);
+    TEST_ASSERT_TRUE(document_id.has_value());
+    auto mounted = runtime.mount_screen(document_id.value(), "/binding_screen");
+    TEST_ASSERT_TRUE(mounted.has_value());
+
+    auto status = runtime.find_view(document_id.value(), "/binding_screen/status").as_label();
+    auto level = runtime.find_view(document_id.value(), "/binding_screen/level").as_slider();
+    TEST_ASSERT_TRUE(status.valid());
+    TEST_ASSERT_TRUE(level.valid());
+    TEST_ASSERT_EQUAL_STRING("Initial", status.text().c_str());
+    TEST_ASSERT_EQUAL_INT32(30, level.value());
+
+    std::string text_seen_during_store_notification;
+    auto background_subscription = runtime.subscribe_binding_value(
+        document_id.value(),
+        "/binding_screen/status",
+        "background",
+        [&](std::string_view, std::string_view, std::string_view) {
+            text_seen_during_store_notification = status.text();
+        }
+    );
+    TEST_ASSERT_TRUE(background_subscription.connected());
+
+    const std::vector<BindingValueUpdate> coalesced_updates = {
+        {"/binding_screen/status", "text", "Updated"},
+        {"/binding_screen/status", "hidden", "true"},
+        {"/binding_screen/status", "color", "#00FF00"},
+        {"/binding_screen/status", "background", "#0F172A"},
+    };
+    const auto props_before_batch = backend_ptr->props_apply_count();
+    const auto layout_before_batch = backend_ptr->layout_apply_count();
+    const auto placement_before_batch = backend_ptr->placement_apply_count();
+    const auto style_before_batch = backend_ptr->style_apply_count();
+
+    runtime.set_binding_values(document_id.value(), coalesced_updates);
+
+    TEST_ASSERT_EQUAL_STRING("Updated", status.text().c_str());
+    TEST_ASSERT_EQUAL_STRING("Initial", text_seen_during_store_notification.c_str());
+    TEST_ASSERT_EQUAL_size_t(props_before_batch + 1, backend_ptr->props_apply_count());
+    TEST_ASSERT_EQUAL_size_t(layout_before_batch, backend_ptr->layout_apply_count());
+    TEST_ASSERT_EQUAL_size_t(placement_before_batch, backend_ptr->placement_apply_count());
+    TEST_ASSERT_EQUAL_size_t(style_before_batch + 1, backend_ptr->style_apply_count());
+
+    runtime.set_binding_values(document_id.value(), coalesced_updates);
+
+    TEST_ASSERT_EQUAL_size_t(props_before_batch + 1, backend_ptr->props_apply_count());
+    TEST_ASSERT_EQUAL_size_t(layout_before_batch, backend_ptr->layout_apply_count());
+    TEST_ASSERT_EQUAL_size_t(placement_before_batch, backend_ptr->placement_apply_count());
+    TEST_ASSERT_EQUAL_size_t(style_before_batch + 1, backend_ptr->style_apply_count());
+
+    // Cross the 64/65 and 128/129 update boundaries, then spill one word beyond
+    // the two-word inline bitmap while preserving duplicate-key update order.
+    std::vector<BindingValueUpdate> boundary_updates;
+    boundary_updates.reserve(129);
+    for (size_t index = 0; index < 129; ++index) {
+        boundary_updates.push_back({
+            "/binding_screen/status",
+            "text",
+            "boundary-" + std::to_string(index),
+        });
+    }
+    const auto props_before_boundaries = backend_ptr->props_apply_count();
+    const auto layout_before_boundaries = backend_ptr->layout_apply_count();
+    const auto placement_before_boundaries = backend_ptr->placement_apply_count();
+    const auto style_before_boundaries = backend_ptr->style_apply_count();
+
+    runtime.set_binding_values(document_id.value(), boundary_updates);
+
+    TEST_ASSERT_EQUAL_STRING("boundary-128", status.text().c_str());
+    TEST_ASSERT_EQUAL_size_t(props_before_boundaries + 1, backend_ptr->props_apply_count());
+    TEST_ASSERT_EQUAL_size_t(layout_before_boundaries, backend_ptr->layout_apply_count());
+    TEST_ASSERT_EQUAL_size_t(placement_before_boundaries, backend_ptr->placement_apply_count());
+    TEST_ASSERT_EQUAL_size_t(style_before_boundaries, backend_ptr->style_apply_count());
+
+    const auto props_before_missing = backend_ptr->props_apply_count();
+    const auto layout_before_missing = backend_ptr->layout_apply_count();
+    const auto placement_before_missing = backend_ptr->placement_apply_count();
+    const auto style_before_missing = backend_ptr->style_apply_count();
+    runtime.set_binding_values(document_id.value(), {
+        {"/binding_screen/missing", "orphan", "persisted"},
+    });
+
+    auto missing_value = runtime.get_binding_value(document_id.value(), "/binding_screen/missing", "orphan");
+    TEST_ASSERT_TRUE(missing_value.has_value());
+    TEST_ASSERT_EQUAL_STRING("persisted", missing_value->c_str());
+    TEST_ASSERT_EQUAL_size_t(props_before_missing, backend_ptr->props_apply_count());
+    TEST_ASSERT_EQUAL_size_t(layout_before_missing, backend_ptr->layout_apply_count());
+    TEST_ASSERT_EQUAL_size_t(placement_before_missing, backend_ptr->placement_apply_count());
+    TEST_ASSERT_EQUAL_size_t(style_before_missing, backend_ptr->style_apply_count());
+
+    const auto props_before_invalid = backend_ptr->props_apply_count();
+    const auto layout_before_invalid = backend_ptr->layout_apply_count();
+    const auto placement_before_invalid = backend_ptr->placement_apply_count();
+    const auto style_before_invalid = backend_ptr->style_apply_count();
+    runtime.set_binding_values(document_id.value(), {
+        {"/binding_screen/level", "level", "not-an-int"},
+    });
+
+    auto invalid_value = runtime.get_binding_value(document_id.value(), "/binding_screen/level", "level");
+    TEST_ASSERT_TRUE(invalid_value.has_value());
+    TEST_ASSERT_EQUAL_STRING("not-an-int", invalid_value->c_str());
+    TEST_ASSERT_EQUAL_INT32(30, level.value());
+    TEST_ASSERT_EQUAL_size_t(props_before_invalid, backend_ptr->props_apply_count());
+    TEST_ASSERT_EQUAL_size_t(layout_before_invalid, backend_ptr->layout_apply_count());
+    TEST_ASSERT_EQUAL_size_t(placement_before_invalid, backend_ptr->placement_apply_count());
+    TEST_ASSERT_EQUAL_size_t(style_before_invalid, backend_ptr->style_apply_count());
+
+    runtime.set_binding_values(document_id.value(), {
+        {"/binding_screen/level", "level", "42"},
+    });
+
+    auto recovered_value = runtime.get_binding_value(document_id.value(), "/binding_screen/level", "level");
+    TEST_ASSERT_TRUE(recovered_value.has_value());
+    TEST_ASSERT_EQUAL_STRING("42", recovered_value->c_str());
+    TEST_ASSERT_EQUAL_INT32(42, level.value());
+    TEST_ASSERT_EQUAL_size_t(props_before_invalid + 1, backend_ptr->props_apply_count());
+    TEST_ASSERT_EQUAL_size_t(layout_before_invalid, backend_ptr->layout_apply_count());
+    TEST_ASSERT_EQUAL_size_t(placement_before_invalid, backend_ptr->placement_apply_count());
+    TEST_ASSERT_EQUAL_size_t(style_before_invalid, backend_ptr->style_apply_count());
     TEST_ASSERT_TRUE(runtime.unload(document_id.value()));
 }
 

@@ -9,6 +9,7 @@
 #include "brookesia/gui_interface/validator.hpp"
 #include "private/binding.hpp"
 #include "brookesia/gui_interface/macro_configs.h"
+#include "brookesia/lib_utils/function_guard.hpp"
 #if BROOKESIA_GUI_INTERFACE_ENABLE_MEMORY_TRACE
 #include "brookesia/lib_utils/memory_profiler.hpp"
 #endif
@@ -18,6 +19,7 @@
 #include "private/utils.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -6032,11 +6034,31 @@ private:
             return;
         }
 
+        // Preserve the store-before-apply transaction order while keeping common
+        // batches in a compact inline bitmap instead of a pointer vector.
+        static constexpr size_t CHANGED_UPDATE_WORD_BITS = sizeof(uint64_t) * 8U;
+        static constexpr size_t INLINE_CHANGED_UPDATE_WORDS = 2;
+        const size_t changed_update_word_count =
+            updates.size() / CHANGED_UPDATE_WORD_BITS +
+            (updates.size() % CHANGED_UPDATE_WORD_BITS != 0U ? 1U : 0U);
+        std::array<uint64_t, INLINE_CHANGED_UPDATE_WORDS> inline_changed_update_bits{};
+        std::vector<uint64_t> spilled_changed_update_bits;
+        uint64_t *changed_update_bits = inline_changed_update_bits.data();
+        if (changed_update_word_count > inline_changed_update_bits.size()) {
+            spilled_changed_update_bits.assign(changed_update_word_count, 0U);
+            changed_update_bits = spilled_changed_update_bits.data();
+        }
+        bool has_changed_updates = false;
+
         const bool previous_suppress = suppress_binding_listener_apply_;
         suppress_binding_listener_apply_ = true;
-        std::vector<const BindingValueUpdate *> changed_updates;
-        changed_updates.reserve(updates.size());
-        for (const auto &update : updates) {
+        lib_utils::FunctionGuard restore_binding_listener_apply(
+            [this, previous_suppress]() noexcept {
+                suppress_binding_listener_apply_ = previous_suppress;
+            }
+        );
+        for (size_t update_index = 0; update_index < updates.size(); ++update_index) {
+            const auto &update = updates[update_index];
             const auto previous = store->get_string(
                 document_id,
                 update.absolute_path,
@@ -6046,16 +6068,23 @@ private:
                 continue;
             }
             store->set_string(document_id, update.absolute_path, update.key, update.value);
-            changed_updates.push_back(&update);
+            has_changed_updates = true;
+            changed_update_bits[update_index / CHANGED_UPDATE_WORD_BITS] |=
+                uint64_t{1} << (update_index % CHANGED_UPDATE_WORD_BITS);
         }
         suppress_binding_listener_apply_ = previous_suppress;
-        if (changed_updates.empty()) {
+        restore_binding_listener_apply.release();
+        if (!has_changed_updates) {
             return;
         }
 
         boost::unordered_flat_map<uint64_t, BindingApplyMasks> dirty_nodes;
-        for (const BindingValueUpdate *changed_update : changed_updates) {
-            const auto &update = *changed_update;
+        for (size_t update_index = 0; update_index < updates.size(); ++update_index) {
+            if ((changed_update_bits[update_index / CHANGED_UPDATE_WORD_BITS] &
+                    (uint64_t{1} << (update_index % CHANGED_UPDATE_WORD_BITS))) == 0U) {
+                continue;
+            }
+            const auto &update = updates[update_index];
             const auto query = normalize_absolute_path(update.absolute_path);
             auto uid = resolve_any_uid(*tree, query);
             if (!uid.has_value()) {
